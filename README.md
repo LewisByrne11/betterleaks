@@ -144,7 +144,10 @@ and the [scanning guide](docs/scanning.md) for details and more examples.
 An experimental local history reader is available with
 `betterleaks git /path/to/repo --git-engine=go-git`. It reads objects without
 Git subprocesses and supports structured date and identity filters. It requires
-Go 1.26 to build and remains opt-in because patch and finding parity are incomplete.
+Go 1.26 to build. `--git-cache-mib` adjusts its default 64 MiB object cache;
+this is separate from total process memory. Findings and coordinates match on
+Betterleaks' history, but broader patch equivalence remains incomplete, so it
+stays opt-in.
 See the [experiment report and reproduction instructions](experiments/gogit-log/README.md).
 
 Rules may also define an optional `revoke` Expr for explicit credential revocation.

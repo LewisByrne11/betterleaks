@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -42,9 +43,11 @@ func (c *treeCache) get(id plumbing.Hash) (*object.Tree, error) {
 	if err != nil {
 		return nil, err
 	}
-	size := 256 + len(t.Entries)*80
+	// Count allocated slice capacity, not only its populated entries. Go's
+	// append growth can otherwise undercharge large decoded trees substantially.
+	size := 256 + cap(t.Entries)*int(reflect.TypeFor[object.TreeEntry]().Size())
 	for _, entry := range t.Entries {
-		size += len(entry.Name)
+		size += (len(entry.Name) + 15) &^ 15
 	}
 	if size > 8<<20 {
 		return t, nil

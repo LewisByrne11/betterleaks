@@ -165,8 +165,13 @@ func TestGoGitOptionValidation(t *testing.T) {
 		{GitEngine: "go-git", Repo: "https://example.test/repo"}, {GitEngine: "go-git", Author: "["},
 		{GitEngine: "go-git", Since: "yesterday"}, {GitEngine: "go-git", Until: "2001-01-01", Since: "2001-01-02"},
 		{GitEngine: "go-git", All: true, Revision: "HEAD"}, {GitEngine: "git", Author: "Test"},
+		{GitEngine: "go-git", GitCacheMiB: -1}, {GitEngine: "go-git", GitCacheMiB: 4097},
+		{GitEngine: "git", GitCacheMiB: 32},
 	} {
 		require.Error(t, cmd.Validate())
 	}
 	require.NoError(t, (GitCmd{GitEngine: "go-git", Author: "Test", Since: "2001-01-01", GitWorkers: 4}).Validate())
+	source, err := (GitCmd{GitEngine: "go-git", GitCacheMiB: 32}).goGitSource()
+	require.NoError(t, err)
+	require.Equal(t, 32, source.CacheMiB)
 }

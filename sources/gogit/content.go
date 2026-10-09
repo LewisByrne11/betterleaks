@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/betterleaks/betterleaks/v2/sources"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/mholt/archives"
@@ -51,8 +52,8 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Upstream's tokenizer encodes IDs as Unicode runes and panics beyond its
-	// alphabet. Bound the possible distinct lines before calling it.
+	// Tokens must fit the edit engine's Unicode alphabet. This also bounds the
+	// bookkeeping allocated for a diff independently of its input byte limit.
 	if strings.Count(src, "\n")+strings.Count(dst, "\n")+2 > 1_000_000 {
 		return errors.New("diff inputs exceed the one-million-line token limit")
 	}
@@ -61,32 +62,82 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 	if deadline, ok := ctx.Deadline(); ok {
 		dmp.DiffTimeout = min(dmp.DiffTimeout, max(time.Until(deadline), time.Nanosecond))
 	}
-	a, b, _ := dmp.DiffLinesToRunes(src, dst)
-	present := make(map[rune]uint8, min(len(a)+len(b), 65536))
-	for _, token := range a {
-		present[token] |= 1
+	// Only parent lines can be matches. Tokenize them once; destination-only
+	// lines need neither IDs nor strings in the dictionary. Use valid Unicode
+	// tokens because the edit engine serializes rune sequences as strings.
+	lineCount := func(text string) int {
+		n := strings.Count(text, "\n")
+		if len(text) > 0 && text[len(text)-1] != '\n' {
+			n++
+		}
+		return n
 	}
-	for _, token := range b {
-		present[token] |= 2
+	oldCount, newCount := lineCount(src), lineCount(dst)
+	ids := make(map[string]rune, min(oldCount, 65536))
+	a := make([]rune, 0, oldCount)
+	for offset := 0; offset < len(src); {
+		end := strings.IndexByte(src[offset:], '\n')
+		if end < 0 {
+			end = len(src)
+		} else {
+			end += offset + 1
+		}
+		line := src[offset:end]
+		id, ok := ids[line]
+		if !ok {
+			id = rune(len(ids) + 1)
+			if id >= 0xd800 {
+				id += 0x800
+			}
+			ids[line] = id
+		}
+		a = append(a, id)
+		offset = end
 	}
-	old := make([]rune, 0, len(a))
-	for _, token := range a {
-		if present[token] == 3 {
-			old = append(old, token)
+	present := make([]bool, len(ids)+1)
+	current := make([]rune, 0, newCount)
+	positions := make([]int, 0, newCount)
+	for offset, pos := 0, 0; offset < len(dst); pos++ {
+		end := strings.IndexByte(dst[offset:], '\n')
+		if end < 0 {
+			end = len(dst)
+		} else {
+			end += offset + 1
+		}
+		if id, ok := ids[dst[offset:end]]; ok {
+			index := id
+			if index >= 0xe000 {
+				index -= 0x800
+			}
+			present[index] = true
+			current = append(current, id)
+			positions = append(positions, pos)
+		}
+		offset = end
+	}
+	old := a[:0]
+	for _, id := range a {
+		index := id
+		if index >= 0xe000 {
+			index -= 0x800
+		}
+		if present[index] {
+			old = append(old, id)
 		}
 	}
-	current := make([]rune, 0, len(b))
-	positions := make([]int, 0, len(b))
-	for i, token := range b {
-		if present[token] == 3 {
-			current = append(current, token)
-			positions = append(positions, i)
+	if len(current) == 0 {
+		if dst == "" {
+			return ctx.Err()
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return emit(dst, 1)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	added := make([]bool, len(b))
+	added := make([]bool, newCount)
 	for i := range added {
 		added[i] = true
 	}
@@ -107,7 +158,8 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 		}
 	}
 	// Slice original bytes directly. No equal/deleted contents are reconstructed,
-	// and the final unterminated line retains its original bytes.
+	// and the final unterminated line retains its original bytes. Clone emitted
+	// slices so a small queued addition cannot keep an entire large blob alive.
 	offset, begin, first := 0, -1, 0
 	for i, yes := range added {
 		if yes && begin < 0 {
@@ -115,7 +167,7 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 			first = i + 1
 		}
 		if !yes && begin >= 0 {
-			if err := emit(dst[begin:offset], first); err != nil {
+			if err := emit(strings.Clone(dst[begin:offset]), first); err != nil {
 				return err
 			}
 			begin = -1
@@ -128,7 +180,10 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 		}
 	}
 	if begin >= 0 {
-		return emit(dst[begin:offset], first)
+		if begin == 0 && offset == len(dst) {
+			return emit(dst, first)
+		}
+		return emit(strings.Clone(dst[begin:offset]), first)
 	}
 	return ctx.Err()
 }
@@ -136,6 +191,11 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, bool, error) {
 	if e.TreeEntry.Mode == filemode.Submodule {
 		return "Subproject commit " + e.TreeEntry.Hash.String() + "\n", false, nil
+	}
+	if obj, ok := w.objects.Get(e.TreeEntry.Hash); ok {
+		if text, ok := obj.(*textBlob); ok {
+			return text.raw, false, nil
+		}
 	}
 	f, err := e.Tree.TreeEntryFile(&e.TreeEntry)
 	if err != nil {
@@ -168,7 +228,11 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 	if int64(text.Len()) != f.Size {
 		return "", false, fmt.Errorf("blob %s size mismatch", e.TreeEntry.Hash)
 	}
-	return text.String(), false, nil
+	raw := text.String()
+	// Replace the materialized byte slice with the string we already own. This
+	// uses the same cache budget, rather than retaining a second blob cache.
+	w.objects.Put(&textBlob{id: e.TreeEntry.Hash, raw: raw})
+	return raw, false, nil
 }
 
 type contextReader struct {
@@ -209,3 +273,26 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: true}
 	return source.Fragments(ctx, yield)
 }
+
+// textBlob is immutable and can also serve as an upstream delta base. Cached
+// text bypasses repeat decoding and byte-to-string copies, never path filtering.
+type textBlob struct {
+	id  plumbing.Hash
+	raw string
+}
+
+func (b *textBlob) Hash() plumbing.Hash       { return b.id }
+func (b *textBlob) Type() plumbing.ObjectType { return plumbing.BlobObject }
+func (b *textBlob) Size() int64               { return int64(len(b.raw)) }
+func (*textBlob) SetType(plumbing.ObjectType) {}
+func (*textBlob) SetSize(int64)               {}
+func (b *textBlob) Reader() (io.ReadCloser, error) {
+	return textBlobReader{strings.NewReader(b.raw)}, nil
+}
+func (*textBlob) Writer() (io.WriteCloser, error) {
+	return nil, errors.New("cached Git blob is read-only")
+}
+
+type textBlobReader struct{ *strings.Reader }
+
+func (textBlobReader) Close() error { return nil }

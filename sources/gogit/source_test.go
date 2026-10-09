@@ -2,9 +2,11 @@ package gogit
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -15,6 +17,10 @@ import (
 	"time"
 
 	"github.com/betterleaks/betterleaks/v2/sources"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/stretchr/testify/require"
 )
 
@@ -318,6 +324,15 @@ func TestLineAdditions(t *testing.T) {
 		fmt.Fprintf(&current, "new-%d\n", i)
 	}
 	check(old.String(), current.String())
+	// Shared tokens cross the Unicode surrogate boundary as well. The final
+	// insertion must retain its original coordinate after matching all of them.
+	var additions []string
+	require.NoError(t, lineAdditions(t.Context(), old.String(), old.String()+"secret\n", func(raw string, line int) error {
+		require.Equal(t, 70001, line)
+		additions = append(additions, raw)
+		return nil
+	}))
+	require.Equal(t, []string{"secret\n"}, additions)
 	require.ErrorContains(t, lineAdditions(t.Context(), strings.Repeat("x\n", 1_000_000), "", func(string, int) error { t.Fatal("oversized line input yielded"); return nil }), "token limit")
 	stop := errors.New("stop")
 	require.ErrorIs(t, lineAdditions(t.Context(), "old\n", "new\n", func(string, int) error { return stop }), stop)
@@ -371,4 +386,203 @@ func FuzzLineAdditions(f *testing.F) {
 			at++
 		}
 	})
+}
+
+// A timestamp walk can encounter a shared first parent while another merge
+// parent remains queued. Stopping at the shared parent loses that entire branch.
+func TestAllHistoryCoverage(t *testing.T) {
+	for _, format := range []string{"sha1", "sha256"} {
+		t.Run(format, func(t *testing.T) {
+			repo := t.TempDir()
+			gitFixture(t, repo, "init", "-q", "-b", "main", "--object-format="+format)
+			gitFixture(t, repo, "config", "user.name", "Test")
+			gitFixture(t, repo, "config", "user.email", "test@example.test")
+			require.NoError(t, os.WriteFile(filepath.Join(repo, "secret"), []byte("TOKEN_HISTORY\n"), 0644))
+			gitFixture(t, repo, "add", ".")
+			tree := gitFixture(t, repo, "write-tree")
+			commit := func(message, date string, parents ...string) string {
+				t.Helper()
+				args := []string{"-C", repo, "commit-tree", tree, "-m", message}
+				for _, parent := range parents {
+					args = append(args, "-p", parent)
+				}
+				cmd := exec.Command("git", args...)
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+				raw, err := cmd.CombinedOutput()
+				require.NoError(t, err, "%s", raw)
+				return strings.TrimSpace(string(raw))
+			}
+			root := commit("root", "2000-01-01T00:00:00Z")
+			shared := commit("shared", "2030-01-01T00:00:00Z", root)
+			side := commit("side", "2010-01-01T00:00:00Z", root)
+			merge := commit("merge", "2020-01-01T00:00:00Z", shared, side)
+			orphan := commit("tag-only", "2005-01-01T00:00:00Z")
+			gitFixture(t, repo, "update-ref", "refs/heads/main", shared)
+			gitFixture(t, repo, "update-ref", "refs/heads/other", merge)
+			gitFixture(t, repo, "update-ref", "refs/remotes/origin/main", shared)
+			gitFixture(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+			gitFixture(t, repo, "tag", "-a", "release", orphan, "-m", "tag")
+			gitFixture(t, repo, "tag", "-a", "nested", "release", "-m", "nested tag")
+			gitFixture(t, repo, "repack", "-ad")
+			expected := strings.Fields(gitFixture(t, repo, "rev-list", "--all"))
+			messages := func(s *Source) map[string]int {
+				s.Include = []string{sources.GitResourceTypeCommitMessages}
+				result := map[string]int{}
+				for _, f := range collect(t, s) {
+					if f.Attr(sources.AttrResource) == sources.ResourceGitCommitMessage {
+						result[f.Attr(sources.AttrGitSHA)]++
+					}
+				}
+				return result
+			}
+			actual := messages(&Source{RepoPath: repo, All: true})
+			require.Len(t, actual, len(expected))
+			for _, sha := range expected {
+				require.Equal(t, 1, actual[sha], "missing or repeated commit %s", sha)
+			}
+			require.Contains(t, actual, side)
+			require.Contains(t, actual, orphan)
+			limited := messages(&Source{RepoPath: repo, All: true, MaxCount: 1})
+			require.Equal(t, map[string]int{shared: 1}, limited)
+			since := time.Date(2009, 1, 1, 0, 0, 0, 0, time.UTC)
+			selected := messages(&Source{RepoPath: repo, All: true, Since: &since})
+			require.Equal(t, map[string]int{side: 1, merge: 1, shared: 1}, selected)
+			// Invalid refs must not be quietly skipped as upstream's All iterator does.
+			missing := strings.Repeat("1", len(root))
+			gitFixture(t, repo, "update-ref", "refs/heads/broken", root)
+			require.NoError(t, os.WriteFile(filepath.Join(repo, ".git", "refs", "heads", "broken"), []byte(missing+"\n"), 0644))
+			err := (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			require.ErrorContains(t, err, "broken")
+			gitFixture(t, repo, "update-ref", "-d", "refs/heads/broken")
+			// A syntactically valid commit can still name an unavailable parent.
+			// Report the gap rather than treating it as the end of that ref's walk.
+			raw := "tree " + tree + "\nparent " + missing + "\nauthor Test <test@example.test> 0 +0000\ncommitter Test <test@example.test> 0 +0000\n\nincomplete history\n"
+			write := exec.Command("git", "-C", repo, "hash-object", "-t", "commit", "-w", "--stdin")
+			write.Stdin = strings.NewReader(raw)
+			written, err := write.CombinedOutput()
+			require.NoError(t, err, "%s", written)
+			gitFixture(t, repo, "update-ref", "refs/heads/incomplete", strings.TrimSpace(string(written)))
+			err = (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			require.ErrorContains(t, err, "parent "+missing)
+		})
+	}
+}
+
+func TestObjectCacheDoesNotRetainPackReaders(t *testing.T) {
+	c := &objectCache{cache.NewObjectLRU(1024)}
+	id := plumbing.NewHash(strings.Repeat("a", 40))
+	lazy := packfile.NewFSObject(id, plumbing.CommitObject, 0, 1, nil, nil, nil, "", c)
+	c.Put(lazy)
+	_, found := c.Get(id)
+	require.False(t, found)
+	memory := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
+	memory.SetType(plumbing.BlobObject)
+	writer, err := memory.Writer()
+	require.NoError(t, err)
+	_, err = writer.Write([]byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	c.Put(memory)
+	actual, found := c.Get(memory.Hash())
+	require.True(t, found)
+	require.Same(t, memory, actual)
+	c.Clear()
+	_, found = c.Get(memory.Hash())
+	require.False(t, found)
+}
+
+func TestCachedTextDeltaBase(t *testing.T) {
+	base := &textBlob{raw: "abc"}
+	reader, err := base.Reader()
+	require.NoError(t, err)
+	seeker, ok := reader.(io.Seeker)
+	require.True(t, ok)
+	_, err = seeker.Seek(1, io.SeekStart)
+	require.NoError(t, err)
+	raw, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, "bc", string(raw))
+	require.NoError(t, reader.Close())
+	_, err = base.Writer()
+	require.Error(t, err)
+	// Copy all three source bytes, then append one literal byte. The source's
+	// cached representation must remain usable by go-git's delta reconstruction.
+	target := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
+	require.NoError(t, packfile.ApplyDelta(target, base, bytes.NewBuffer([]byte{3, 4, 0x90, 3, 1, 'd'})))
+	result, err := target.Reader()
+	require.NoError(t, err)
+	defer result.Close()
+	raw, err = io.ReadAll(result)
+	require.NoError(t, err)
+	require.Equal(t, "abcd", string(raw))
+	require.Equal(t, plumbing.BlobObject, base.Type())
+	require.Equal(t, int64(3), base.Size())
+}
+
+type slowHashObject struct {
+	plumbing.EncodedObject
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (o *slowHashObject) Hash() plumbing.Hash {
+	o.once.Do(func() { close(o.entered); <-o.release })
+	return o.EncodedObject.Hash()
+}
+
+func TestObjectHashDoesNotBlockCache(t *testing.T) {
+	c := &objectCache{cache.NewObjectLRU(1024)}
+	seed := &textBlob{id: plumbing.NewHash(strings.Repeat("1", 40)), raw: "seed"}
+	c.Put(seed)
+	obj := &slowHashObject{EncodedObject: &textBlob{id: plumbing.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
+	put := make(chan struct{})
+	defer func() { close(obj.release); <-put }()
+	go func() { c.Put(obj); close(put) }()
+	<-obj.entered
+	lookup := make(chan bool, 1)
+	go func() { _, ok := c.Get(seed.id); lookup <- ok }()
+	select {
+	case ok := <-lookup:
+		require.True(t, ok)
+	case <-time.After(2 * time.Second):
+		t.Fatal("hashing an unpublished object blocked unrelated cache lookup")
+	}
+}
+
+// Set BETTERLEAKS_GIT_BENCH_REPO to an absolute fixture path. No detector or
+// tree traversal runs here, making graph retention and startup costs visible.
+func BenchmarkHistory(b *testing.B) {
+	path := os.Getenv("BETTERLEAKS_GIT_BENCH_REPO")
+	if path == "" {
+		b.Skip("set BETTERLEAKS_GIT_BENCH_REPO")
+	}
+	b.ReportAllocs()
+	for range b.N {
+		s := &Source{RepoPath: path, All: true}
+		r, _, close, err := s.open()
+		if err != nil {
+			b.Fatal(err)
+		}
+		h, err := s.history(b.Context(), r)
+		if err != nil {
+			close()
+			b.Fatal(err)
+		}
+		n, frontier := 0, 0
+		for {
+			_, err := h.next(b.Context())
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				close()
+				b.Fatal(err)
+			}
+			n++
+			frontier = max(frontier, len(h.frontier))
+		}
+		close()
+		b.ReportMetric(float64(n), "commits/op")
+		b.ReportMetric(float64(frontier), "frontier/op")
+	}
 }

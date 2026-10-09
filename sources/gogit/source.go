@@ -16,8 +16,6 @@ import (
 
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"golang.org/x/sync/errgroup"
 )
@@ -25,6 +23,8 @@ import (
 // Source scans HEAD's reachable history by default. Merges are compared against
 // their first parent, matching Betterleaks' existing Git source. Include can add commit-messages.
 // Diff boundaries and rename choices can differ from Git's xdiff implementation.
+// Traversal retains one visited object ID per discovered commit, not every
+// decoded commit. Worker queues and object/tree caches have separate bounds.
 // All settings are immutable while Fragments runs; calls can run independently.
 type Source struct {
 	RepoPath string
@@ -40,7 +40,8 @@ type Source struct {
 	MaxCount          int
 	// Workers defaults to min(GOMAXPROCS, 4). Work queues and caches are bounded.
 	Workers int
-	// CacheMiB defaults to 96; the parsed-tree cache has a separate 32 MiB budget.
+	// CacheMiB defaults to 64 and limits cached materialized content bytes,
+	// excluding object overhead. Parsed trees have a separate 32 MiB budget.
 	CacheMiB int
 	// MaxBlobBytes defaults to 64 MiB. Exceeding it returns an incomplete-scan
 	// error, rather than silently omitting content. It bounds diff inputs, not
@@ -89,28 +90,15 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	r, cleanup, err := s.open()
+	r, objects, cleanup, err := s.open()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	opts := &git.LogOptions{All: s.All, Order: git.LogOrderCommitterTime, Since: s.Since, Until: s.Until}
-	if !s.All {
-		revision := s.Revision
-		if revision == "" {
-			revision = "HEAD"
-		}
-		hash, e := r.ResolveRevision(plumbing.Revision(revision))
-		if e != nil {
-			return fmt.Errorf("resolve revision %q: %w", revision, e)
-		}
-		opts.From = *hash
-	}
-	iter, err := r.Log(opts)
+	history, err := s.history(ctx, r)
 	if err != nil {
 		return err
 	}
-	defer iter.Close()
 	author, _ := regexp.Compile(s.Author)
 	committer, _ := regexp.Compile(s.Committer)
 	workers := s.Workers
@@ -127,7 +115,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	jobs := make(chan *object.Commit, workers)
 	for range workers {
 		group.Go(func() error {
-			w := worker{source: s, trees: trees, maxBlob: maxBlob}
+			w := worker{source: s, trees: trees, objects: objects, maxBlob: maxBlob}
 			for {
 				select {
 				case <-workCtx.Done():
@@ -150,12 +138,15 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			if err := workCtx.Err(); err != nil {
 				return err
 			}
-			c, e := iter.Next()
+			c, e := history.next(workCtx)
 			if errors.Is(e, io.EOF) {
 				return nil
 			}
 			if e != nil {
 				return e
+			}
+			if (s.Since != nil && c.Committer.When.Before(*s.Since)) || (s.Until != nil && c.Committer.When.After(*s.Until)) {
+				continue
 			}
 			if !author.MatchString(c.Author.Name+" <"+c.Author.Email+">") || !committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">") {
 				continue
@@ -175,6 +166,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 type worker struct {
 	source  *Source
 	trees   *treeCache
+	objects *objectCache
 	maxBlob int64
 	buffer  [32 << 10]byte
 }

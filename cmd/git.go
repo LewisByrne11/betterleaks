@@ -46,6 +46,7 @@ type GitCmd struct {
 	NoMergePatches  bool     `group:"source" name:"no-merge-patches" help:"go-git: suppress merge patches, matching plain git log -p. By default merges are compared with their first parent."`
 	MaxCount        int      `group:"source" name:"max-count" help:"go-git: maximum selected commits; zero is unlimited."`
 	GitWorkers      int      `group:"source" name:"git-workers" help:"go-git: concurrent history workers (default up to 4, maximum 16)."`
+	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"go-git: cached object content in MiB; zero uses 64 MiB. This is not a process memory limit."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"go-git: maximum diff input size; exceeding it reports an incomplete scan."`
 	Include         []string `group:"source" help:"Additional Git resources to scan: commit-messages, tag-messages, reflogs."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
@@ -71,8 +72,8 @@ func (cmd GitCmd) Validate() error {
 		}
 		return src.Validate()
 	}
-	if cmd.Since != "" || cmd.Until != "" || cmd.Author != "" || cmd.Committer != "" || cmd.Revision != "" || cmd.All || cmd.NoMergePatches || cmd.MaxCount != 0 || cmd.GitWorkers != 0 || (cmd.GitMaxBlobMiB != 0 && cmd.GitMaxBlobMiB != 64) {
-		return errors.New("structured history filters and worker/blob settings require --git-engine=go-git")
+	if cmd.Since != "" || cmd.Until != "" || cmd.Author != "" || cmd.Committer != "" || cmd.Revision != "" || cmd.All || cmd.NoMergePatches || cmd.MaxCount != 0 || cmd.GitWorkers != 0 || cmd.GitCacheMiB != 0 || (cmd.GitMaxBlobMiB != 0 && cmd.GitMaxBlobMiB != 64) {
+		return errors.New("structured history filters and worker/cache/blob settings require --git-engine=go-git")
 	}
 	if cmd.Staged && cmd.Unstaged {
 		return errors.New("--staged and --unstaged are mutually exclusive")
@@ -259,6 +260,9 @@ func (cmd GitCmd) goGitSource() (*gogit.Source, error) {
 	if cmd.GitMaxBlobMiB < 0 || cmd.GitMaxBlobMiB > 4096 {
 		return nil, errors.New("--git-max-blob-mib must be between 0 and 4096")
 	}
+	if cmd.GitCacheMiB < 0 || cmd.GitCacheMiB > 4096 {
+		return nil, errors.New("--git-cache-mib must be between 0 and 4096")
+	}
 	if cmd.All && cmd.Revision != "" {
 		return nil, errors.New("--all and --revision are mutually exclusive")
 	}
@@ -267,7 +271,7 @@ func (cmd GitCmd) goGitSource() (*gogit.Source, error) {
 		repo = "."
 	}
 	return &gogit.Source{RepoPath: repo, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", NoMergePatches: cmd.NoMergePatches, Since: since, Until: until,
-		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers,
+		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB,
 		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
 }
 
