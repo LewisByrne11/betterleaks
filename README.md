@@ -141,6 +141,12 @@ bounded reads and downloads; Git uses one history stream when `--log-opts` is
 provided. See [parallel jobs](docs/scanning.md#parallel-jobs)
 and the [scanning guide](docs/scanning.md) for details and more examples.
 
+An experimental local history reader is available with
+`betterleaks git /path/to/repo --git-engine=go-git`. It reads objects without
+Git subprocesses and supports structured date and identity filters. It requires
+Go 1.26 to build and remains opt-in because patch and finding parity are incomplete.
+See the [experiment report and reproduction instructions](experiments/gogit-log/README.md).
+
 Rules may also define an optional `revoke` Expr for explicit credential revocation.
 Use `betterleaks config show ids --revocation` to find configured support and
 `betterleaks revoke --rule <id>` to execute it. Scans never run revocation.

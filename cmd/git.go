@@ -12,6 +12,7 @@ import (
 	"github.com/betterleaks/betterleaks/v2/pipeline"
 	"github.com/betterleaks/betterleaks/v2/scan"
 	"github.com/betterleaks/betterleaks/v2/sources"
+	"github.com/betterleaks/betterleaks/v2/sources/gogit"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
 )
 
@@ -35,6 +36,17 @@ type GitCmd struct {
 	PreReceive      bool     `group:"source" name:"pre-receive" help:"Run as a Git pre-receive hook, scanning pushed commits read from stdin."`
 	PreReceiveError string   `group:"source" name:"pre-receive-error-message" help:"Message printed to stderr when the pre-receive hook finds leaks; environment variables in $$VAR and $${VAR} form are expanded."`
 	LogOpts         string   `group:"source" name:"log-opts" help:"Git log options (uses one history stream to preserve option semantics)."`
+	GitEngine       string   `group:"source" name:"git-engine" default:"git" enum:"git,go-git" help:"History reader: git subprocesses or the experimental local go-git object reader."`
+	Since           string   `group:"source" help:"go-git: minimum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
+	Until           string   `group:"source" help:"go-git: maximum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
+	Author          string   `group:"source" help:"go-git: Go regular expression matching author name and email."`
+	Committer       string   `group:"source" help:"go-git: Go regular expression matching committer name and email."`
+	Revision        string   `group:"source" help:"go-git: starting revision; when omitted, scans all refs."`
+	All             bool     `group:"source" help:"go-git: scan history reachable from all refs (default unless --revision is set)."`
+	NoMergePatches  bool     `group:"source" name:"no-merge-patches" help:"go-git: suppress merge patches, matching plain git log -p. By default merges are compared with their first parent."`
+	MaxCount        int      `group:"source" name:"max-count" help:"go-git: maximum selected commits; zero is unlimited."`
+	GitWorkers      int      `group:"source" name:"git-workers" help:"go-git: concurrent history workers (default up to 4, maximum 16)."`
+	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"go-git: maximum diff input size; exceeding it reports an incomplete scan."`
 	Include         []string `group:"source" help:"Additional Git resources to scan: commit-messages, tag-messages, reflogs."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
 }
@@ -42,6 +54,25 @@ type GitCmd struct {
 func (cmd GitCmd) Validate() error {
 	if err := cmd.ScanFlags.Validate(); err != nil {
 		return err
+	}
+	if cmd.GitEngine != "" && cmd.GitEngine != "git" && cmd.GitEngine != "go-git" {
+		return fmt.Errorf("unknown Git engine %q", cmd.GitEngine)
+	}
+	if cmd.GitEngine == "go-git" {
+		if cmd.Staged || cmd.Unstaged || cmd.PreReceive || remoteGitURL(cmd.Repo) || cmd.Token != "" {
+			return errors.New("go-git currently supports local committed history only; staged, unstaged, pre-receive and remote scans are unsupported")
+		}
+		if cmd.LogOpts != "" {
+			return errors.New("go-git does not accept arbitrary --log-opts; use --since, --until, --author, --committer, --revision, --all or --max-count")
+		}
+		src, err := cmd.goGitSource()
+		if err != nil {
+			return err
+		}
+		return src.Validate()
+	}
+	if cmd.Since != "" || cmd.Until != "" || cmd.Author != "" || cmd.Committer != "" || cmd.Revision != "" || cmd.All || cmd.NoMergePatches || cmd.MaxCount != 0 || cmd.GitWorkers != 0 || (cmd.GitMaxBlobMiB != 0 && cmd.GitMaxBlobMiB != 64) {
+		return errors.New("structured history filters and worker/blob settings require --git-engine=go-git")
 	}
 	if cmd.Staged && cmd.Unstaged {
 		return errors.New("--staged and --unstaged are mutually exclusive")
@@ -108,7 +139,15 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 
 	var src sources.Source
 
-	if options.PreReceive {
+	if options.GitEngine == "go-git" {
+		goSource, sourceErr := options.goGitSource()
+		if sourceErr != nil {
+			runtime.fatal("invalid go-git source", "error", sourceErr)
+			return
+		}
+		goSource.Logger, goSource.Prefilter = runtime.Logger(), filters.shouldSkip
+		src = goSource
+	} else if options.PreReceive {
 		updates, parseErr := sources.ParsePreReceiveInput(runtime.stdin)
 		if parseErr != nil {
 			runtime.fatal("could not read pre-receive input", "error", parseErr)
@@ -191,6 +230,45 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 	}
 
 	findingSummaryAndExit(runtime, summary, runner.ValidationEnabled(), findings, options.ExitCode, start, err)
+}
+
+func (cmd GitCmd) goGitSource() (*gogit.Source, error) {
+	parseDate := func(value string) (*time.Time, error) {
+		if value == "" {
+			return nil, nil
+		}
+		for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+			if date, err := time.Parse(layout, value); err == nil {
+				return &date, nil
+			}
+		}
+		return nil, fmt.Errorf("invalid history date %q; use RFC3339 or YYYY-MM-DD", value)
+	}
+	since, err := parseDate(cmd.Since)
+	if err != nil {
+		return nil, err
+	}
+	until, err := parseDate(cmd.Until)
+	if err != nil {
+		return nil, err
+	}
+	platform, err := scm.PlatformFromString(cmd.Platform)
+	if err != nil {
+		return nil, err
+	}
+	if cmd.GitMaxBlobMiB < 0 || cmd.GitMaxBlobMiB > 4096 {
+		return nil, errors.New("--git-max-blob-mib must be between 0 and 4096")
+	}
+	if cmd.All && cmd.Revision != "" {
+		return nil, errors.New("--all and --revision are mutually exclusive")
+	}
+	repo := cmd.Repo
+	if repo == "" {
+		repo = "."
+	}
+	return &gogit.Source{RepoPath: repo, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", NoMergePatches: cmd.NoMergePatches, Since: since, Until: until,
+		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers,
+		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
 }
 
 // An existing path wins even when its spelling resembles a URL.

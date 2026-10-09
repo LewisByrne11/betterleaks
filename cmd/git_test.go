@@ -117,3 +117,56 @@ func TestPreReceiveHookRejectsMergeSecret(t *testing.T) {
 	require.Equal(t, 1, code, "a secret introduced only in a merge must reject the push")
 	require.Contains(t, stderr, "leaks found")
 }
+
+func TestGoGitHistoryWithoutExecutable(t *testing.T) {
+	repo := t.TempDir()
+	gitCmdT(t, repo, "init", "-q", "-b", "main")
+	gitCmdT(t, repo, "config", "user.email", "first@example.test")
+	gitCmdT(t, repo, "config", "user.name", "First")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "root.txt"), []byte("before\nSECRET_ONE\nafter\n"), 0644))
+	gitCmdT(t, repo, "add", ".")
+	gitCmdT(t, repo, "commit", "-qm", "root")
+	rootSHA := gitCmdT(t, repo, "rev-parse", "HEAD")
+	gitCmdT(t, repo, "rm", "-q", "root.txt")
+	gitCmdT(t, repo, "commit", "-qm", "deleted")
+	gitCmdT(t, repo, "checkout", "-qb", "side", rootSHA)
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "branch.txt"), []byte("SECRET_TWO\n"), 0644))
+	gitCmdT(t, repo, "add", ".")
+	gitCmdT(t, repo, "-c", "user.name=Side", "commit", "-qm", "side")
+	gitCmdT(t, repo, "checkout", "-q", "main")
+	gitCmdT(t, repo, "repack", "-ad")
+	configPath := writeTestConfig(t, "[[rules]]\nid='git-secret'\nregex='SECRET_[A-Z]+'\n")
+	t.Setenv("PATH", t.TempDir())
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		count int
+	}{
+		{"all refs", nil, 2}, {"head", []string{"--revision=HEAD"}, 1}, {"author", []string{"--author=Side"}, 1}, {"date", []string{"--since=2030-01-01"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, stdout := newTestCLI(t)
+			args := append([]string{"git", repo, "--git-engine=go-git", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}, tc.args...)
+			root.SetArgs(args)
+			require.NoError(t, root.Execute())
+			_, findings := decodeScanJSON(t, stdout.Bytes())
+			require.Len(t, findings, tc.count)
+			for _, finding := range findings {
+				require.Len(t, finding.Attributes["git.blob_sha"], 40)
+				require.Len(t, finding.Attributes["git.sha"], 40)
+			}
+		})
+	}
+}
+
+func TestGoGitOptionValidation(t *testing.T) {
+	for _, cmd := range []GitCmd{
+		{GitEngine: "go-git", Staged: true}, {GitEngine: "go-git", LogOpts: "--since=2001-01-01"},
+		{GitEngine: "go-git", Repo: "https://example.test/repo"}, {GitEngine: "go-git", Author: "["},
+		{GitEngine: "go-git", Since: "yesterday"}, {GitEngine: "go-git", Until: "2001-01-01", Since: "2001-01-02"},
+		{GitEngine: "go-git", All: true, Revision: "HEAD"}, {GitEngine: "git", Author: "Test"},
+	} {
+		require.Error(t, cmd.Validate())
+	}
+	require.NoError(t, (GitCmd{GitEngine: "go-git", Author: "Test", Since: "2001-01-01", GitWorkers: 4}).Validate())
+}
