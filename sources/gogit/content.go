@@ -22,6 +22,21 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 	if c.From.Name != "" && c.From.TreeEntry.Hash == c.To.TreeEntry.Hash && !kindChanged {
 		return nil
 	}
+	cacheable := c.From.Name != "" && !kindChanged && c.From.TreeEntry.Mode != filemode.Submodule && c.To.TreeEntry.Mode != filemode.Submodule
+	key := patchKey{c.From.TreeEntry.Hash, c.To.TreeEntry.Hash}
+	if cacheable {
+		if additions, ok := w.patches.get(key); ok {
+			for _, a := range additions {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if err := emit(a.raw, a.line); err != nil {
+					return err
+				}
+			}
+			return ctx.Err()
+		}
+	}
 	dst, binary, err := w.content(ctx, c.To)
 	if err != nil {
 		return err
@@ -39,7 +54,29 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 	if binary {
 		return nil
 	}
-	return lineAdditions(ctx, src, dst, emit)
+	if !cacheable || w.patches == nil {
+		return w.differ.additions(ctx, src, dst, emit)
+	}
+	var additions []textAddition
+	size := patchOverhead
+	err = w.differ.additions(ctx, src, dst, func(raw string, line int) error {
+		if err := emit(raw, line); err != nil {
+			return err
+		}
+		if size <= maxCachedPatch {
+			size += len(raw) + 24
+			if size <= maxCachedPatch {
+				additions = append(additions, textAddition{raw, line})
+			} else {
+				additions = nil
+			}
+		}
+		return nil
+	})
+	if err == nil && size <= maxCachedPatch {
+		w.patches.put(key, additions)
+	}
+	return err
 }
 
 // Lines absent from the other file cannot be matches. Remove them before the
@@ -49,6 +86,27 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 // As with Git's own preprocessing, ambiguous edit boundaries can differ from
 // an unpruned diff. We preserve exact destination contents and line numbers.
 func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) error) error {
+	var d lineDiffer
+	return d.additions(ctx, src, dst, emit)
+}
+
+// Each worker reuses its line bookkeeping, but releases unusually large diffs
+// and clears dictionary keys so scratch space never keeps old blobs alive.
+type lineDiffer struct {
+	ids            map[string]rune
+	old, current   []rune
+	positions      []int
+	present, added []bool
+}
+
+func resize[T any](s []T, n int) []T {
+	if cap(s) < n {
+		return make([]T, n)
+	}
+	return s[:n]
+}
+
+func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(string, int) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -56,6 +114,15 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 	// bookkeeping allocated for a diff independently of its input byte limit.
 	if strings.Count(src, "\n")+strings.Count(dst, "\n")+2 > 1_000_000 {
 		return errors.New("diff inputs exceed the one-million-line token limit")
+	}
+	// These are the common-prefix cases the edit engine would remove anyway.
+	// Require a line boundary: appending bytes to an unterminated final line
+	// replaces that line instead of introducing a new one.
+	if src == dst || (strings.HasPrefix(src, dst) && (dst == "" || dst[len(dst)-1] == '\n')) {
+		return nil
+	}
+	if strings.HasPrefix(dst, src) && (src == "" || src[len(src)-1] == '\n') {
+		return emit(strings.Clone(dst[len(src):]), strings.Count(src, "\n")+1)
 	}
 	dmp := diffmatchpatch.New()
 	dmp.DiffTimeout = time.Hour
@@ -73,8 +140,24 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 		return n
 	}
 	oldCount, newCount := lineCount(src), lineCount(dst)
-	ids := make(map[string]rune, min(oldCount, 65536))
-	a := make([]rune, 0, oldCount)
+	if d.ids == nil {
+		d.ids = make(map[string]rune, min(oldCount, 65536))
+	}
+	ids := d.ids
+	defer func() {
+		if len(ids) > 4096 {
+			// Clearing a large map visits its whole capacity, even for the many
+			// tiny files that follow it. Retain only the common small dictionaries.
+			d.ids = nil
+		} else {
+			clear(ids)
+		}
+		if oldCount > 65536 || newCount > 65536 {
+			*d = lineDiffer{}
+		}
+	}()
+	d.old = resize(d.old, oldCount)
+	a := d.old[:0]
 	for offset := 0; offset < len(src); {
 		end := strings.IndexByte(src[offset:], '\n')
 		if end < 0 {
@@ -94,9 +177,13 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 		a = append(a, id)
 		offset = end
 	}
-	present := make([]bool, len(ids)+1)
-	current := make([]rune, 0, newCount)
-	positions := make([]int, 0, newCount)
+	d.present = resize(d.present, len(ids)+1)
+	present := d.present
+	clear(present)
+	d.current = resize(d.current, newCount)
+	current := d.current[:0]
+	d.positions = resize(d.positions, newCount)
+	positions := d.positions[:0]
 	for offset, pos := 0, 0; offset < len(dst); pos++ {
 		end := strings.IndexByte(dst[offset:], '\n')
 		if end < 0 {
@@ -137,7 +224,8 @@ func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	added := make([]bool, newCount)
+	d.added = resize(d.added, newCount)
+	added := d.added
 	for i := range added {
 		added[i] = true
 	}
@@ -192,47 +280,20 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 	if e.TreeEntry.Mode == filemode.Submodule {
 		return "Subproject commit " + e.TreeEntry.Hash.String() + "\n", false, nil
 	}
-	if obj, ok := w.objects.Get(e.TreeEntry.Hash); ok {
-		if text, ok := obj.(*textBlob); ok {
-			return text.raw, false, nil
-		}
+	if err := ctx.Err(); err != nil {
+		return "", false, err
 	}
-	f, err := e.Tree.TreeEntryFile(&e.TreeEntry)
+	obj, err := w.store.read(e.TreeEntry.Hash, 0)
 	if err != nil {
 		return "", false, err
 	}
-	if f.Size < 0 || f.Size > w.maxBlob {
-		return "", false, fmt.Errorf("blob %s size %d exceeds diff input limit %d", e.TreeEntry.Hash, f.Size, w.maxBlob)
+	if obj.kind != plumbing.BlobObject {
+		return "", false, plumbing.ErrObjectNotFound
 	}
-	r, err := f.Reader()
-	if err != nil {
-		return "", false, err
+	if obj.Size() > w.maxBlob {
+		return "", false, fmt.Errorf("blob %s size %d exceeds diff input limit %d", e.TreeEntry.Hash, obj.Size(), w.maxBlob)
 	}
-	defer r.Close()
-	reader := contextReader{ctx: ctx, r: r}
-	prefix := w.buffer[:8000]
-	n, err := io.ReadFull(reader, prefix)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return "", false, err
-	}
-	if strings.IndexByte(string(prefix[:n]), 0) >= 0 {
-		return "", true, nil
-	}
-	var text strings.Builder
-	text.Grow(int(f.Size))
-	text.Write(prefix[:n])
-	_, err = io.CopyBuffer(&text, reader, w.buffer[:])
-	if err != nil {
-		return "", false, err
-	}
-	if int64(text.Len()) != f.Size {
-		return "", false, fmt.Errorf("blob %s size mismatch", e.TreeEntry.Hash)
-	}
-	raw := text.String()
-	// Replace the materialized byte slice with the string we already own. This
-	// uses the same cache budget, rather than retaining a second blob cache.
-	w.objects.Put(&textBlob{id: e.TreeEntry.Hash, raw: raw})
-	return raw, false, nil
+	return obj.raw, strings.IndexByte(obj.raw[:min(len(obj.raw), 8000)], 0) >= 0, nil
 }
 
 type contextReader struct {
@@ -261,7 +322,7 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 	if format == nil {
 		return nil
 	}
-	file, err := e.Tree.TreeEntryFile(&e.TreeEntry)
+	file, err := w.store.read(e.TreeEntry.Hash, 0)
 	if err != nil {
 		return err
 	}
@@ -273,26 +334,3 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: true}
 	return source.Fragments(ctx, yield)
 }
-
-// textBlob is immutable and can also serve as an upstream delta base. Cached
-// text bypasses repeat decoding and byte-to-string copies, never path filtering.
-type textBlob struct {
-	id  plumbing.Hash
-	raw string
-}
-
-func (b *textBlob) Hash() plumbing.Hash       { return b.id }
-func (b *textBlob) Type() plumbing.ObjectType { return plumbing.BlobObject }
-func (b *textBlob) Size() int64               { return int64(len(b.raw)) }
-func (*textBlob) SetType(plumbing.ObjectType) {}
-func (*textBlob) SetSize(int64)               {}
-func (b *textBlob) Reader() (io.ReadCloser, error) {
-	return textBlobReader{strings.NewReader(b.raw)}, nil
-}
-func (*textBlob) Writer() (io.WriteCloser, error) {
-	return nil, errors.New("cached Git blob is read-only")
-}
-
-type textBlobReader struct{ *strings.Reader }
-
-func (textBlobReader) Close() error { return nil }

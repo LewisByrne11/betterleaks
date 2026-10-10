@@ -1,6 +1,7 @@
 package gogit
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -16,7 +17,7 @@ import (
 	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
-func (s *Source) open() (*git.Repository, *objectCache, func(), error) {
+func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(), error) {
 	// Reuse upstream discovery for bare repositories, gitdir files and commondir.
 	// No worktree operations or object traversal run against this initial store.
 	discovered, err := git.PlainOpen(s.RepoPath)
@@ -64,7 +65,7 @@ func (s *Source) open() (*git.Repository, *objectCache, func(), error) {
 	}
 	budget := s.CacheMiB
 	if budget == 0 {
-		budget = 64
+		budget = 256
 	}
 	// Billy confines absolute paths to its root. A shared local clone's
 	// alternates can lie outside the Git directory, so give alternate reads a
@@ -92,24 +93,39 @@ func (s *Source) open() (*git.Repository, *objectCache, func(), error) {
 	altFS := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
 	objects := &objectCache{cache.NewObjectLRU(cache.FileSize(budget) << 20)}
 	store := filesystem.NewStorageWithOptions(fs, objects, filesystem.Options{LargeObjectThreshold: 1 << 20, AlternatesFS: altFS})
-	r, err := git.Open(store, nil)
-	if err != nil {
+	reader := &objectStorage{Storage: store, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, 64<<20)}
+	diskBudget := s.DiskCacheMiB
+	if diskBudget == 0 {
+		diskBudget = 1024
+	}
+	if diskBudget > 0 {
+		reader.disk = &diskObjectCache{segmentSize: int64(diskBudget) << 20 / 8}
+	}
+	if err := reader.openPacks(fs); err != nil {
+		reader.closePacks()
 		store.Close()
 		return nil, nil, nil, err
 	}
-	return r, objects, func() { store.Close() }, nil
+	r, err := git.Open(reader, nil)
+	if err != nil {
+		reader.closePacks()
+		store.Close()
+		return nil, nil, nil, err
+	}
+	return r, objects, func() { reader.closePacks(); store.Close() }, nil
 }
 
-// Mapping only indexes removes random index-read syscalls without making the
-// entire pack's resident pages part of RSS. This wrapper preserves upstream's
-// commondir/alternate routing, and forbids storage mutations.
+// Read-only mappings remove random pack/index read syscalls. Resident mapped
+// pages count toward RSS separately from the bounded object caches; the OS can
+// reclaim clean pages. This wrapper preserves upstream's commondir/alternate
+// routing and forbids repository mutations.
 type readOnlyFS struct {
 	billy.Filesystem
 	objectRoot string
 }
 
 func (f readOnlyFS) Open(path string) (billy.File, error) {
-	if strings.HasPrefix(filepath.ToSlash(path), "objects/pack/") && (strings.HasSuffix(path, ".idx") || strings.HasSuffix(path, ".rev")) {
+	if strings.HasPrefix(filepath.ToSlash(path), "objects/pack/") && (strings.HasSuffix(path, ".idx") || strings.HasSuffix(path, ".rev") || strings.HasSuffix(path, ".pack")) {
 		return osfs.New(f.objectRoot, osfs.WithMmap()).Open(path)
 	}
 	return f.Filesystem.Open(path)

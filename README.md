@@ -85,6 +85,9 @@ betterleaks fs /path/to/target -a
 # Scan a git repo
 betterleaks git /path/to/repo
 
+# Suppress merge commit patches while still traversing both parents
+betterleaks git /path/to/repo --include-merges=false
+
 # Automatically detect a remote repository and scan its history
 betterleaks https://github.com/betterleaks/betterleaks
 # The default command can also be named explicitly
@@ -138,16 +141,30 @@ see [fingerprint privacy and key setup](docs/scanning.md#ignore-exact-secret-val
 `-j` / `--jobs` controls detection concurrency only, defaulting to `4 * GOMAXPROCS`.
 Sources manage their own
 bounded reads and downloads; Git uses one history stream when `--log-opts` is
-provided. See [parallel jobs](docs/scanning.md#parallel-jobs)
+provided. Both Git engines include merge patches by default; use
+`--include-merges=false` to suppress them. See [parallel jobs](docs/scanning.md#parallel-jobs)
 and the [scanning guide](docs/scanning.md) for details and more examples.
 
 An experimental local history reader is available with
 `betterleaks git /path/to/repo --git-engine=go-git`. It reads objects without
 Git subprocesses and supports structured date and identity filters. It requires
-Go 1.26 to build. `--git-cache-mib` adjusts its default 64 MiB object cache;
-this is separate from total process memory. Findings and coordinates match on
-Betterleaks' history, but broader patch equivalence remains incomplete, so it
-stays opt-in.
+Go 1.26 to build. Packs with reverse indexes use a read-only fast path with
+bounded caches; other storage layouts retain go-git's reader.
+`--git-workers` adjusts history concurrency for either engine (up to eight
+workers by default for go-git, four for Git; maximum 16), independently of
+detection concurrency. `--git-cache-mib` adjusts the 256 MiB object memory cache;
+use `--git-cache-mib=64` for lower memory use at the cost of more object decoding.
+`--git-disk-cache-mib` adjusts a private temporary cache of large objects, capped
+at 1024 MiB by default; use `-1` to disable it. The temporary file is created only
+when needed and removed after scanning. Parsed trees and reusable text patches
+each have a separate 32 MiB cache. These budgets exclude mapped pack pages,
+diff workspace and detection memory. Binary archive scanning is unchanged.
+Broader patch and rename equivalence remains
+incomplete, so this reader stays opt-in. Reproduce full scan timing, process-tree
+memory and finding parity with `scripts/benchmark_gogit.py`.
+The [initial benchmark data](docs/benchmarks/go-git-optimization-2026-10-09.json)
+and [16-worker follow-up](docs/benchmarks/go-git-followup-2026-10-10.json) record
+Rails and GitLab measurements, tradeoffs and known parity gaps.
 See the [experiment report and reproduction instructions](experiments/gogit-log/README.md).
 
 Rules may also define an optional `revoke` Expr for explicit credential revocation.

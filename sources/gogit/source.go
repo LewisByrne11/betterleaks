@@ -38,11 +38,16 @@ type Source struct {
 	// Author and Committer are Go regular expressions over "Name <email>".
 	Author, Committer string
 	MaxCount          int
-	// Workers defaults to min(GOMAXPROCS, 4). Work queues and caches are bounded.
+	// Workers defaults to min(GOMAXPROCS, 8). Work queues and caches are bounded.
 	Workers int
-	// CacheMiB defaults to 64 and limits cached materialized content bytes,
+	// CacheMiB defaults to 256 and limits cached materialized content bytes,
 	// excluding object overhead. Parsed trees have a separate 32 MiB budget.
 	CacheMiB int
+	// DiskCacheMiB bounds a private temporary cache of large reconstructed
+	// objects. Zero uses 1024 MiB; -1 disables it. The file is created lazily
+	// in os.TempDir and removed when the scan ends. Cache I/O failure falls
+	// back to object reconstruction without dropping scan content.
+	DiskCacheMiB int
 	// MaxBlobBytes defaults to 64 MiB. Exceeding it returns an incomplete-scan
 	// error, rather than silently omitting content. It bounds diff inputs, not
 	// go-git's internal delta reconstruction or the process's complete RSS.
@@ -51,8 +56,11 @@ type Source struct {
 	Prefilter       sources.PrefilterFunc
 	MaxArchiveDepth int
 	Logger          *slog.Logger
-	Platform        scm.Platform
-	RemoteURL       string
+	// Platform and RemoteURL control finding links. By default they are resolved
+	// from the local repository's fetch remote without invoking Git. NoPlatform
+	// disables links; RemoteURL overrides the configured remote.
+	Platform  scm.Platform
+	RemoteURL string
 }
 
 var _ sources.Source = (*Source)(nil)
@@ -61,7 +69,7 @@ func (s *Source) Validate() error {
 	if s.RepoPath == "" {
 		return errors.New("go-git source requires a local repository path")
 	}
-	if s.Workers < 0 || s.Workers > 16 || s.CacheMiB < 0 || s.MaxCount < 0 || s.MaxBlobBytes < 0 {
+	if s.Workers < 0 || s.Workers > 16 || s.CacheMiB < 0 || s.DiskCacheMiB < -1 || s.DiskCacheMiB > 4096 || s.MaxCount < 0 || s.MaxBlobBytes < 0 {
 		return errors.New("invalid go-git worker, cache, count, or blob limit")
 	}
 	if s.All && s.Revision != "" {
@@ -90,11 +98,15 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	r, objects, cleanup, err := s.open()
+	r, _, cleanup, err := s.open(ctx)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	// Resolve once per scan without mutating caller-owned settings; the same
+	// Source can be scanned concurrently.
+	resolved := *s
+	resolved.Platform, resolved.RemoteURL = s.resolveRemote(r)
 	history, err := s.history(ctx, r)
 	if err != nil {
 		return err
@@ -103,9 +115,10 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	committer, _ := regexp.Compile(s.Committer)
 	workers := s.Workers
 	if workers == 0 {
-		workers = min(max(runtime.GOMAXPROCS(0), 1), 4)
+		workers = min(max(runtime.GOMAXPROCS(0), 1), 8)
 	}
 	trees := &treeCache{r: r}
+	patches := &patchCache{}
 	maxBlob := s.MaxBlobBytes
 	if maxBlob == 0 {
 		maxBlob = 64 << 20
@@ -115,7 +128,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	jobs := make(chan *object.Commit, workers)
 	for range workers {
 		group.Go(func() error {
-			w := worker{source: s, trees: trees, objects: objects, maxBlob: maxBlob}
+			w := worker{source: &resolved, trees: trees, store: r.Storer.(*objectStorage), maxBlob: maxBlob, patches: patches}
 			for {
 				select {
 				case <-workCtx.Done():
@@ -160,15 +173,20 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 		}
 		return nil
 	})
-	return group.Wait()
+	err = group.Wait()
+	if s.Logger != nil {
+		s.Logger.Debug("git text patch cache", "hits", patches.hits, "misses", patches.misses, "entries", len(patches.entries), "bytes", patches.bytes)
+	}
+	return err
 }
 
 type worker struct {
 	source  *Source
 	trees   *treeCache
-	objects *objectCache
+	store   *objectStorage
 	maxBlob int64
-	buffer  [32 << 10]byte
+	differ  lineDiffer
+	patches *patchCache
 }
 
 func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.FragmentsFunc) error {

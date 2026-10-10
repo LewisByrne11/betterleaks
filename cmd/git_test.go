@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"archive/zip"
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,11 +13,196 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGitBinaryArchiveMembersIncluded(t *testing.T) {
+	repo := t.TempDir()
+	gitCmdT(t, repo, "init", "-q")
+	gitCmdT(t, repo, "config", "user.name", "Archive Test")
+	gitCmdT(t, repo, "config", "user.email", "archive@example.test")
+	makeZip := func(files map[string][]byte) []byte {
+		t.Helper()
+		var out bytes.Buffer
+		writer := zip.NewWriter(&out)
+		for name, content := range files {
+			entry, err := writer.Create(name)
+			require.NoError(t, err)
+			_, err = entry.Write(content)
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		return out.Bytes()
+	}
+	nested := makeZip(map[string][]byte{
+		"text.bin":  []byte("SECRET_NESTED_TEXT\n"),
+		"image.txt": []byte("\x89PNG\r\n\x1a\n\x00SECRET_NESTED_BINARY\n"),
+	})
+	archive := makeZip(map[string][]byte{
+		"text.txt":   []byte("SECRET_TEXT\n"),
+		"data.bin":   []byte("\x00SECRET_BINARY\x00\n"),
+		"nested.zip": nested,
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "secrets.zip"), archive, 0600))
+	gitCmdT(t, repo, "add", ".")
+	gitCmdT(t, repo, "commit", "-qm", "archive")
+	configPath := writeTestConfig(t, "[[rules]]\nid='archive-secret'\nregex='SECRET_[A-Z_]+'\n")
+	for _, engine := range []string{"git", "go-git"} {
+		t.Run(engine, func(t *testing.T) {
+			root, stdout := newTestCLI(t)
+			root.SetArgs([]string{"git", repo, "--git-engine=" + engine, "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"})
+			require.NoError(t, root.Execute())
+			_, findings := decodeScanJSON(t, stdout.Bytes())
+			var values []string
+			for _, finding := range findings {
+				values = append(values, finding.Match.Value)
+			}
+			require.ElementsMatch(t, []string{"SECRET_TEXT", "SECRET_NESTED_TEXT", "SECRET_BINARY", "SECRET_NESTED_BINARY"}, values)
+		})
+	}
+}
+
+func TestGitFindingURLs(t *testing.T) {
+	repo := t.TempDir()
+	gitCmdT(t, repo, "init", "-q", "-b", "main")
+	gitCmdT(t, repo, "config", "user.name", "URL Test")
+	gitCmdT(t, repo, "config", "user.email", "url@example.test")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "secret file.txt"), []byte("ordinary\nSECRET_FILE\n"), 0600))
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("member.txt")
+	require.NoError(t, err)
+	_, err = entry.Write([]byte("ordinary\nSECRET_ARCHIVE\n"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "archive.zip"), archive.Bytes(), 0600))
+	gitCmdT(t, repo, "add", ".")
+	gitCmdT(t, repo, "commit", "-qm", "SECRET_MESSAGE")
+	sha := gitCmdT(t, repo, "rev-parse", "HEAD")
+	gitCmdT(t, repo, "remote", "add", "origin", "https://github.com/org/repo.git")
+	configPath := writeTestConfig(t, "[[rules]]\nid='url-secret'\nregex='SECRET_[A-Z_]+'\n")
+	for _, tc := range []struct {
+		name, remote, platform, base, commitPath string
+	}{
+		{"GitHub HTTPS", "https://user:fixture-password@github.com/org/repo.git?token=fixture-query#fixture-fragment", "", "https://github.com/org/repo", "/commit/"},
+		{"GitLab SSH", "git@gitlab.com:group/sub/repo.git", "", "https://gitlab.com/group/sub/repo", "/-/commit/"},
+		{"self hosted", "ssh://git@git.example.test:2222/group/repo.git", "gitlab", "https://git.example.test/group/repo", "/-/commit/"},
+		{"disabled", "https://github.com/org/repo.git", "none", "", ""},
+		{"unknown host", "https://example.test/org/repo.git", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gitCmdT(t, repo, "remote", "set-url", "origin", tc.remote)
+			for _, engine := range []string{"git", "go-git"} {
+				t.Run(engine, func(t *testing.T) {
+					if engine == "go-git" {
+						t.Setenv("PATH", t.TempDir())
+					}
+					root, stdout := newTestCLI(t)
+					args := []string{"git", repo, "--git-engine=" + engine, "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
+					if tc.platform != "" {
+						args = append(args, "--platform="+tc.platform)
+					}
+					root.SetArgs(args)
+					require.NoError(t, root.Execute())
+					_, findings := decodeScanJSON(t, stdout.Bytes())
+					require.Len(t, findings, 3)
+					for _, finding := range findings {
+						want := ""
+						if tc.base != "" {
+							switch finding.Match.Value {
+							case "SECRET_FILE":
+								want = tc.base + "/blob/" + sha + "/secret%20file.txt#L2"
+							case "SECRET_ARCHIVE":
+								want = tc.base + "/blob/" + sha + "/archive.zip"
+							case "SECRET_MESSAGE":
+								want = tc.base + tc.commitPath + sha
+							default:
+								t.Fatalf("unexpected fixture finding %q", finding.Match.Value)
+							}
+						}
+						require.Equal(t, want, finding.Attributes["url"])
+					}
+					for _, private := range []string{"fixture-password", "fixture-query", "fixture-fragment"} {
+						require.NotContains(t, stdout.String(), private)
+					}
+				})
+			}
+		})
+	}
+}
+
 func gitCmdT(t *testing.T, repo string, args ...string) string {
 	t.Helper()
 	out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
 	require.NoError(t, err, "%s", out)
 	return strings.TrimSpace(string(out))
+}
+
+func TestGitIncludeMerges(t *testing.T) {
+	repo := t.TempDir()
+	gitCmdT(t, repo, "init", "-q", "-b", "main")
+	gitCmdT(t, repo, "config", "user.name", "Merge Test")
+	gitCmdT(t, repo, "config", "user.email", "merge@example.test")
+	write := func(name, value string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte(value+"\n"), 0600))
+		gitCmdT(t, repo, "add", name)
+	}
+	write("root.txt", "SECRET_ROOT")
+	gitCmdT(t, repo, "commit", "-qm", "base")
+	gitCmdT(t, repo, "checkout", "-qb", "side")
+	write("side.txt", "SECRET_SIDE")
+	gitCmdT(t, repo, "commit", "-qm", "side")
+	sideSHA := gitCmdT(t, repo, "rev-parse", "HEAD")
+	gitCmdT(t, repo, "rm", "side.txt")
+	gitCmdT(t, repo, "commit", "-qm", "delete side secret")
+	gitCmdT(t, repo, "checkout", "-q", "main")
+	write("main.txt", "ordinary content")
+	gitCmdT(t, repo, "commit", "-qm", "main")
+	gitCmdT(t, repo, "merge", "--no-ff", "side", "-m", "SECRET_MERGE_MESSAGE")
+	write("merge.txt", "SECRET_MERGE_CONTENT")
+	gitCmdT(t, repo, "commit", "--amend", "--no-edit")
+	mergeSHA := gitCmdT(t, repo, "rev-parse", "HEAD")
+	gitCmdT(t, repo, "branch", "-D", "side")
+	configPath := writeTestConfig(t, "[[rules]]\nid='merge-secret'\nregex='SECRET_[A-Z_]+'\n")
+	for _, engine := range []string{"git", "go-git"} {
+		for _, workers := range []int{1, 4} {
+			for _, tc := range []struct {
+				name      string
+				flag      string
+				wantMerge bool
+			}{
+				{"default", "", true},
+				{"enabled", "--include-merges", true},
+				{"explicit true", "--include-merges=true", true},
+				{"disabled", "--include-merges=false", false},
+				{"legacy alias", "--no-merge-patches", false},
+			} {
+				t.Run(fmt.Sprintf("%s/workers=%d/%s", engine, workers, tc.name), func(t *testing.T) {
+					root, stdout := newTestCLI(t)
+					args := []string{"git", repo, "--git-engine=" + engine, fmt.Sprintf("--git-workers=%d", workers), "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
+					if tc.flag != "" {
+						args = append(args, tc.flag)
+					}
+					root.SetArgs(args)
+					require.NoError(t, root.Execute())
+					_, findings := decodeScanJSON(t, stdout.Bytes())
+					var values []string
+					for _, f := range findings {
+						values = append(values, f.Match.Value)
+						switch f.Match.Value {
+						case "SECRET_SIDE":
+							require.Equal(t, sideSHA, f.Attributes["git.sha"])
+						case "SECRET_MERGE_MESSAGE", "SECRET_MERGE_CONTENT":
+							require.Equal(t, mergeSHA, f.Attributes["git.sha"])
+						}
+					}
+					want := []string{"SECRET_ROOT", "SECRET_SIDE", "SECRET_MERGE_MESSAGE"}
+					if tc.wantMerge {
+						want = append(want, "SECRET_MERGE_CONTENT")
+					}
+					require.ElementsMatch(t, want, values)
+				})
+			}
+		}
+	}
 }
 
 // runPreReceive drives the git command as a pre-receive hook with the given
@@ -116,6 +303,9 @@ func TestPreReceiveHookRejectsMergeSecret(t *testing.T) {
 		oldSHA+" "+newSHA+" refs/heads/main\n")
 	require.Equal(t, 1, code, "a secret introduced only in a merge must reject the push")
 	require.Contains(t, stderr, "leaks found")
+	code, _ = runPreReceive(t, repo, configPath,
+		oldSHA+" "+newSHA+" refs/heads/main\n", "--include-merges=false")
+	require.Zero(t, code, "explicitly suppressing merge patches must also apply to pre-receive scans")
 }
 
 func TestGoGitHistoryWithoutExecutable(t *testing.T) {
@@ -167,11 +357,18 @@ func TestGoGitOptionValidation(t *testing.T) {
 		{GitEngine: "go-git", All: true, Revision: "HEAD"}, {GitEngine: "git", Author: "Test"},
 		{GitEngine: "go-git", GitCacheMiB: -1}, {GitEngine: "go-git", GitCacheMiB: 4097},
 		{GitEngine: "git", GitCacheMiB: 32},
+		{GitEngine: "git", GitDiskCacheMiB: -1},
+		{GitEngine: "git", GitWorkers: -1}, {GitEngine: "git", GitWorkers: 17},
+		{GitEngine: "go-git", GitDiskCacheMiB: -2}, {GitEngine: "go-git", GitDiskCacheMiB: 4097},
 	} {
 		require.Error(t, cmd.Validate())
 	}
 	require.NoError(t, (GitCmd{GitEngine: "go-git", Author: "Test", Since: "2001-01-01", GitWorkers: 4}).Validate())
+	require.NoError(t, (GitCmd{GitEngine: "git", GitWorkers: 16}).Validate())
 	source, err := (GitCmd{GitEngine: "go-git", GitCacheMiB: 32}).goGitSource()
 	require.NoError(t, err)
 	require.Equal(t, 32, source.CacheMiB)
+	source, err = (GitCmd{GitEngine: "go-git", GitDiskCacheMiB: -1}).goGitSource()
+	require.NoError(t, err)
+	require.Equal(t, -1, source.DiskCacheMiB)
 }

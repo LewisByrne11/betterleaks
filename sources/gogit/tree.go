@@ -78,8 +78,29 @@ func treeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (objec
 	if err != nil {
 		return nil, err
 	}
-	// Retain upstream rename detection with Git's configured default limits.
-	return object.DetectRenames(changes, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000})
+	// TreeEntryFile enforces checkout-safe names, even though rename detection
+	// only reads blobs by ID. Historical paths (including a literal backslash
+	// in GitLab) need not be portable checkout paths. Give those blob handles a
+	// harmless name; ChangeEntry.Name still holds the actual path used to score
+	// renames and emit metadata. No tree content is materialized on disk.
+	for _, change := range changes {
+		if change.From.Name != "" {
+			change.From.TreeEntry.Name = "blob"
+		}
+		if change.To.Name != "" {
+			change.To.TreeEntry.Name = "blob"
+		}
+	}
+	changes, err = object.DetectRenames(changes, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000})
+	for _, change := range changes {
+		if change.From.Name != "" {
+			change.From.TreeEntry.Name = change.From.Name[strings.LastIndexByte(change.From.Name, '/')+1:]
+		}
+		if change.To.Name != "" {
+			change.To.TreeEntry.Name = change.To.Name[strings.LastIndexByte(change.To.Name, '/')+1:]
+		}
+	}
+	return changes, err
 }
 
 func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (object.Changes, error) {

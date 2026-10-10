@@ -37,16 +37,18 @@ type GitCmd struct {
 	PreReceiveError string   `group:"source" name:"pre-receive-error-message" help:"Message printed to stderr when the pre-receive hook finds leaks; environment variables in $$VAR and $${VAR} form are expanded."`
 	LogOpts         string   `group:"source" name:"log-opts" help:"Git log options (uses one history stream to preserve option semantics)."`
 	GitEngine       string   `group:"source" name:"git-engine" default:"git" enum:"git,go-git" help:"History reader: git subprocesses or the experimental local go-git object reader."`
+	IncludeMerges   *bool    `group:"source" name:"include-merges" help:"Scan merge commit patches against the first parent (default true). Use --include-merges=false to suppress merge patches; both parents' histories remain included."`
 	Since           string   `group:"source" help:"go-git: minimum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
 	Until           string   `group:"source" help:"go-git: maximum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
 	Author          string   `group:"source" help:"go-git: Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"go-git: Go regular expression matching committer name and email."`
 	Revision        string   `group:"source" help:"go-git: starting revision; when omitted, scans all refs."`
 	All             bool     `group:"source" help:"go-git: scan history reachable from all refs (default unless --revision is set)."`
-	NoMergePatches  bool     `group:"source" name:"no-merge-patches" help:"go-git: suppress merge patches, matching plain git log -p. By default merges are compared with their first parent."`
+	NoMergePatches  bool     `group:"source" name:"no-merge-patches" hidden:"" help:"Alias for --include-merges=false."`
 	MaxCount        int      `group:"source" name:"max-count" help:"go-git: maximum selected commits; zero is unlimited."`
-	GitWorkers      int      `group:"source" name:"git-workers" help:"go-git: concurrent history workers (default up to 4, maximum 16)."`
-	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"go-git: cached object content in MiB; zero uses 64 MiB. This is not a process memory limit."`
+	GitWorkers      int      `group:"source" name:"git-workers" help:"Concurrent history readers (git defaults up to 4, go-git up to 8; maximum 16). Explicit --log-opts uses one Git process."`
+	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"go-git: cached object content in MiB; zero uses 256 MiB. This is not a process memory limit."`
+	GitDiskCacheMiB int      `group:"source" name:"git-disk-cache-mib" help:"go-git: temporary object cache in MiB; zero uses 1024 MiB, -1 disables. Removed after scanning."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"go-git: maximum diff input size; exceeding it reports an incomplete scan."`
 	Include         []string `group:"source" help:"Additional Git resources to scan: commit-messages, tag-messages, reflogs."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
@@ -55,6 +57,15 @@ type GitCmd struct {
 func (cmd GitCmd) Validate() error {
 	if err := cmd.ScanFlags.Validate(); err != nil {
 		return err
+	}
+	if cmd.GitWorkers < 0 || cmd.GitWorkers > 16 {
+		return errors.New("--git-workers must be between 0 and 16")
+	}
+	if cmd.NoMergePatches && cmd.IncludeMerges != nil && *cmd.IncludeMerges {
+		return errors.New("--include-merges=true cannot be combined with --no-merge-patches")
+	}
+	if (cmd.Staged || cmd.Unstaged) && (cmd.IncludeMerges != nil || cmd.NoMergePatches) {
+		return errors.New("merge patch options require a committed history scan; they cannot be combined with --staged or --unstaged")
 	}
 	if cmd.GitEngine != "" && cmd.GitEngine != "git" && cmd.GitEngine != "go-git" {
 		return fmt.Errorf("unknown Git engine %q", cmd.GitEngine)
@@ -72,8 +83,8 @@ func (cmd GitCmd) Validate() error {
 		}
 		return src.Validate()
 	}
-	if cmd.Since != "" || cmd.Until != "" || cmd.Author != "" || cmd.Committer != "" || cmd.Revision != "" || cmd.All || cmd.NoMergePatches || cmd.MaxCount != 0 || cmd.GitWorkers != 0 || cmd.GitCacheMiB != 0 || (cmd.GitMaxBlobMiB != 0 && cmd.GitMaxBlobMiB != 64) {
-		return errors.New("structured history filters and worker/cache/blob settings require --git-engine=go-git")
+	if cmd.Since != "" || cmd.Until != "" || cmd.Author != "" || cmd.Committer != "" || cmd.Revision != "" || cmd.All || cmd.MaxCount != 0 || cmd.GitCacheMiB != 0 || cmd.GitDiskCacheMiB != 0 || (cmd.GitMaxBlobMiB != 0 && cmd.GitMaxBlobMiB != 64) {
+		return errors.New("structured history filters and cache/blob settings require --git-engine=go-git")
 	}
 	if cmd.Staged && cmd.Unstaged {
 		return errors.New("--staged and --unstaged are mutually exclusive")
@@ -171,6 +182,7 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 			Platform:        scm.NoPlatform,
 			MaxArchiveDepth: options.MaxArchiveDepth,
 			LogOpts:         strings.Join(logArgs, " "),
+			NoMergePatches:  options.skipMergePatches(),
 		}
 	} else if options.Unstaged || options.Staged {
 		mode := sources.GitWorkingTree
@@ -199,6 +211,8 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 		gitSource := &sources.Git{
 			Logger:          runtime.Logger(),
 			RepoPath:        source,
+			Workers:         options.GitWorkers,
+			NoMergePatches:  options.skipMergePatches(),
 			Prefilter:       filters.shouldSkip,
 			Platform:        resolvedPlatform,
 			RemoteURL:       remoteURL,
@@ -263,6 +277,9 @@ func (cmd GitCmd) goGitSource() (*gogit.Source, error) {
 	if cmd.GitCacheMiB < 0 || cmd.GitCacheMiB > 4096 {
 		return nil, errors.New("--git-cache-mib must be between 0 and 4096")
 	}
+	if cmd.GitDiskCacheMiB < -1 || cmd.GitDiskCacheMiB > 4096 {
+		return nil, errors.New("--git-disk-cache-mib must be between -1 and 4096")
+	}
 	if cmd.All && cmd.Revision != "" {
 		return nil, errors.New("--all and --revision are mutually exclusive")
 	}
@@ -270,9 +287,13 @@ func (cmd GitCmd) goGitSource() (*gogit.Source, error) {
 	if repo == "" {
 		repo = "."
 	}
-	return &gogit.Source{RepoPath: repo, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", NoMergePatches: cmd.NoMergePatches, Since: since, Until: until,
-		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB,
+	return &gogit.Source{RepoPath: repo, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", NoMergePatches: cmd.skipMergePatches(), Since: since, Until: until,
+		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB, DiskCacheMiB: cmd.GitDiskCacheMiB,
 		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
+}
+
+func (cmd GitCmd) skipMergePatches() bool {
+	return cmd.NoMergePatches || (cmd.IncludeMerges != nil && !*cmd.IncludeMerges)
 }
 
 // An existing path wins even when its spelling resembles a URL.

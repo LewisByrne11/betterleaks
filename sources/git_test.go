@@ -50,15 +50,15 @@ func TestGitConfigIsolationEnv(t *testing.T) {
 func TestGitRepoCPUCountsHaveSameCoverage(t *testing.T) {
 	repo := newGitTestRepo(t, 4)
 
-	scan := func(workers int) []string {
+	scan := func(cpus, workers int) []string {
 		t.Helper()
-		previous := runtime.GOMAXPROCS(workers)
+		previous := runtime.GOMAXPROCS(cpus)
 		defer runtime.GOMAXPROCS(previous)
 		var (
 			mu        sync.Mutex
 			fragments []string
 		)
-		source := &Git{RepoPath: repo}
+		source := &Git{RepoPath: repo, Workers: workers}
 		require.NoError(t, source.Fragments(t.Context(), func(fragment Fragment, err error) error {
 			if err != nil {
 				return err
@@ -73,7 +73,12 @@ func TestGitRepoCPUCountsHaveSameCoverage(t *testing.T) {
 		return fragments
 	}
 
-	require.Equal(t, scan(1), scan(2))
+	want := scan(1, 0)
+	require.Equal(t, want, scan(2, 0))
+	require.Equal(t, want, scan(2, 16))
+	require.Equal(t, want, scan(2, 1))
+	require.Error(t, (&Git{RepoPath: repo, Workers: -1}).Validate())
+	require.Error(t, (&Git{RepoPath: repo, Workers: 17}).Validate())
 }
 
 func TestGitMergeSecrets(t *testing.T) {
@@ -128,16 +133,21 @@ func TestGitMergeSecrets(t *testing.T) {
 					name, opts string
 					messages   bool
 					wantSide   bool
+					noMerges   bool
 				}{
 					{name: "default", wantSide: true},
 					{name: "explicit history", opts: "--all --full-history", wantSide: true},
 					{name: "range and path", opts: mergeSHA + "^.." + mergeSHA + " -- file-0.txt"},
 					{name: "diff search and messages", opts: "-G MERGE_ONLY_SECRET " + mergeSHA + "^.." + mergeSHA, messages: true},
+					{name: "without merge patches", noMerges: true, wantSide: true},
+					{name: "explicit history without merge patches", opts: "--all --full-history", noMerges: true, wantSide: true},
+					{name: "suppress requested merge diffs with pathspec", opts: "--all --diff-merges=first-parent -- .", noMerges: true, wantSide: true},
+					{name: "diff search without merge patches", opts: "-G MERGE_ONLY_SECRET " + mergeSHA + "^.." + mergeSHA, messages: true, noMerges: true},
 				} {
 					t.Run(fmt.Sprintf("workers=%d/%s", workers, tc.name), func(t *testing.T) {
 						previous := runtime.GOMAXPROCS(workers)
 						defer runtime.GOMAXPROCS(previous)
-						source := &Git{RepoPath: repo, LogOpts: tc.opts}
+						source := &Git{RepoPath: repo, LogOpts: tc.opts, NoMergePatches: tc.noMerges}
 						if tc.messages {
 							source.Include = []string{GitResourceTypeCommitMessages}
 						}
@@ -165,13 +175,17 @@ func TestGitMergeSecrets(t *testing.T) {
 								require.Equal(t, sideSHA, f.Attr(AttrGitSHA))
 							}
 						}
-						require.Equal(t, 1, merges)
+						if tc.noMerges {
+							require.Zero(t, merges)
+						} else {
+							require.Equal(t, 1, merges)
+						}
 						if tc.wantSide {
 							require.Equal(t, 1, sides)
 						} else {
 							require.Zero(t, sides)
 						}
-						if tc.messages {
+						if tc.messages && !tc.noMerges {
 							require.Equal(t, 1, messages)
 						} else {
 							require.Zero(t, messages)
@@ -443,7 +457,7 @@ func TestGitStreamMatchesPatchParser(t *testing.T) {
 
 	for _, opts := range []string{"", "--all -U3", "--all --format=fuller", "--all --format=email", "--all --oneline", "--all --binary", "--all -- 'space name.txt'", "--all -G changed", "--all --diff-filter=A"} {
 		t.Run(opts, func(t *testing.T) {
-			command, err := newGitLogCmd(t.Context(), repo, opts, nil)
+			command, err := newGitLogCmd(t.Context(), repo, opts, false, nil)
 			require.NoError(t, err)
 			collect := func(source *Git) []Fragment {
 				var mu sync.Mutex

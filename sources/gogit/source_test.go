@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -203,6 +204,27 @@ func TestSource(t *testing.T) {
 		_, err := os.Stat(filepath.Join(repo, "executed"))
 		require.ErrorIs(t, err, os.ErrNotExist)
 	})
+}
+
+func TestHistoricalPathNames(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture contains a literal backslash filename")
+	}
+	repo := newHistory(t)
+	old := strings.Repeat("common line\n", 100) + "TOKEN_BEFORE\n"
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "before"), []byte(old), 0600))
+	gitFixture(t, repo, "add", "before")
+	gitFixture(t, repo, "commit", "-qm", "before historical rename")
+	name := "\\"
+	gitFixture(t, repo, "mv", "before", name)
+	require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte(strings.Repeat("common line\n", 100)+"TOKEN_AFTER\n"), 0600))
+	gitFixture(t, repo, "add", "--", name)
+	gitFixture(t, repo, "commit", "-qm", "historical rename")
+	fs := collect(t, &Source{RepoPath: repo, MaxCount: 1})
+	require.Len(t, fs, 1)
+	require.Equal(t, name, fs[0].Attr(sources.AttrPath))
+	require.Equal(t, "TOKEN_AFTER\n", fs[0].Raw)
+	require.Equal(t, 101, fs[0].StartLine)
 }
 
 func TestSelectionAndArchives(t *testing.T) {
@@ -492,7 +514,7 @@ func TestObjectCacheDoesNotRetainPackReaders(t *testing.T) {
 }
 
 func TestCachedTextDeltaBase(t *testing.T) {
-	base := &textBlob{raw: "abc"}
+	base := &storedObject{kind: plumbing.BlobObject, raw: "abc"}
 	reader, err := base.Reader()
 	require.NoError(t, err)
 	seeker, ok := reader.(io.Seeker)
@@ -532,9 +554,9 @@ func (o *slowHashObject) Hash() plumbing.Hash {
 
 func TestObjectHashDoesNotBlockCache(t *testing.T) {
 	c := &objectCache{cache.NewObjectLRU(1024)}
-	seed := &textBlob{id: plumbing.NewHash(strings.Repeat("1", 40)), raw: "seed"}
+	seed := &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("1", 40)), raw: "seed"}
 	c.Put(seed)
-	obj := &slowHashObject{EncodedObject: &textBlob{id: plumbing.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
+	obj := &slowHashObject{EncodedObject: &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
 	put := make(chan struct{})
 	defer func() { close(obj.release); <-put }()
 	go func() { c.Put(obj); close(put) }()
@@ -559,7 +581,7 @@ func BenchmarkHistory(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		s := &Source{RepoPath: path, All: true}
-		r, _, close, err := s.open()
+		r, _, close, err := s.open(b.Context())
 		if err != nil {
 			b.Fatal(err)
 		}

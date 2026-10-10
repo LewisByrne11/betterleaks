@@ -51,13 +51,14 @@ betterleaks filesystem . -j 8
 betterleaks github https://github.com/my-company -j 8
 ```
 
-Sources choose their own bounded I/O concurrency. These are internal policies,
-not configuration options:
+Sources choose their own bounded I/O concurrency. Git history readers also
+accept `--git-workers` (maximum 16), independently of detection concurrency:
 
 | Source work | Concurrency |
 | :--- | :--- |
 | Filesystem readers | `GOMAXPROCS` |
-| Git history processes | Up to `min(GOMAXPROCS, 4)`; one with explicit `--log-opts` |
+| Git history processes | Up to `min(GOMAXPROCS, 4)`; adjustable with `--git-workers`; one with explicit `--log-opts` |
+| Experimental `--git-engine=go-git` history workers | Up to `min(GOMAXPROCS, 8)`; adjustable with `--git-workers` |
 | S3 and Hugging Face object reads | 4 |
 | GitHub Actions runs | 4 |
 | Provider repositories or buckets | One target at a time |
@@ -85,7 +86,8 @@ Source API request ceilings and provider rate limits remain independent of these
 settings.
 
 The Go API configures detection with `scan.WithWorkers(n)` and credential
-evaluation with `analyze.WithWorkers(n)`. Sources have no worker setting. The
+evaluation with `analyze.WithWorkers(n)`. Source concurrency is independent;
+`sources.Git` and the experimental `gogit.Source` expose history worker counts as `Workers`. The
 detection limit is shared across concurrent `Scan` and `ScanString` calls on the
 same scanner. As with the CLI, zero uses `4 * GOMAXPROCS` and explicit positive
 counts are not capped at `GOMAXPROCS`.
@@ -639,12 +641,48 @@ betterleaks git . --include=reflogs
 betterleaks git . --include=reflogs,commit-messages
 ```
 
-Merge commits are scanned against their first parent by default, while history
-traversal still includes all parents. This catches secrets introduced during a
-merge or conflict resolution. A secret can be reported again when merged into
-another branch. Combined diff output (`--cc` or `-c`) is unsupported and causes
-an error when encountered; use `--diff-merges=first-parent` or
-`--diff-merges=separate` for merge patches.
+Both Git engines add `attributes.url` to findings when the repository's fetch
+remote identifies a supported host. Links include the commit, file and line;
+archive findings link to the outer archive, and commit-message findings link to
+the commit. The native engine reads local Git configuration without invoking
+Git or accessing the network. Use `--platform=github` or `--platform=gitlab` for
+self-hosted instances, or `--platform=none` to disable links. Local-path remotes
+do not produce web links. Remote credentials and query parameters are omitted.
+
+Links are constructed from local metadata; scans do not check whether the host
+can serve each commit. Default history scans include all local refs, so findings
+on unpublished branches or local checkpoint refs can have URLs that return 404.
+The finding's commit and path still identify the content in the local repository.
+Use `--revision=origin/main` with `--git-engine=go-git` to limit the scan to that
+fetched branch's history; this excludes findings unique to other branches.
+
+`--include-merges` controls merge commit patches for both Git engines and is
+enabled by default. Merges are compared with their first parent, while history
+traversal includes all parents. This catches secrets introduced during a merge
+or conflict resolution; it can also report a branch's secret again at the merge.
+
+```sh
+# Include merge patches (the default)
+betterleaks git . --include-merges
+
+# Suppress merge patches, matching v1's plain git log -p policy
+betterleaks git . --include-merges=false
+betterleaks git . --git-engine=go-git --include-merges=false
+```
+
+Disabling merge patches still scans commits from both parents. It also retains
+merge commit messages when `--include=commit-messages` is selected, but skips
+content introduced only by a merge. The option applies to history and
+pre-receive scans; it cannot be used with `--staged` or `--unstaged`.
+`--no-merge-patches` remains an alias for `--include-merges=false`.
+SDK callers set `NoMergePatches: true` on `sources.Git` or `gogit.Source` to
+suppress merge patches; their zero value includes them.
+
+With the Git subprocess engine, disabling merge patches overrides merge-diff
+options in `--log-opts`. Otherwise custom Git merge-diff options still apply.
+Combined diff output (`--cc` or `-c`) is unsupported and causes an error when
+encountered; use `--diff-merges=first-parent` or `--diff-merges=separate` for
+merge patches.
 
 Nonempty `--log-opts` uses one patch history stream so Git applies pathspecs,
 diff filters, and history options together. For example,

@@ -507,13 +507,37 @@ func TestRemovedWorkerFlagsAreRejected(t *testing.T) {
 	tests := [][]string{
 		{"fs", "--source-workers=2"},
 		{"fs", "--detect-workers=2"},
-		{"git", "--git-workers=2"},
 		{"s3", "--workers=2", "s3://bucket"},
 	}
 	for _, args := range tests {
 		_, err := parseCLIForTest(t, args...)
 		require.Error(t, err, "parseCLIForTest(%q)", args)
 	}
+}
+
+func TestGitWorkerFlagSelectsSourceConcurrency(t *testing.T) {
+	for _, engine := range []string{"git", "go-git"} {
+		cli, err := parseCLIForTest(t, "git", "--git-engine="+engine, "--git-workers=16")
+		require.NoError(t, err)
+		require.Equal(t, 16, cli.Git.GitWorkers)
+		require.Zero(t, cli.Git.Jobs, "source workers must not override detection concurrency")
+	}
+}
+
+func TestGitMergeOptionValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"git", "--include-merges", "--no-merge-patches"},
+		{"git", "--git-engine=go-git", "--include-merges=true", "--no-merge-patches"},
+		{"git", "--staged", "--include-merges=false"},
+		{"git", "--unstaged", "--include-merges"},
+		{"git", "--staged", "--no-merge-patches"},
+	} {
+		_, err := parseCLIForTest(t, args...)
+		require.Error(t, err, "%v", args)
+	}
+	cli, err := parseCLIForTest(t, "git", "--include-merges=false", "--no-merge-patches")
+	require.NoError(t, err)
+	require.True(t, cli.Git.skipMergePatches())
 }
 
 func TestExpandRuleFlagShorthands(t *testing.T) {

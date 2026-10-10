@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -56,6 +54,13 @@ type Git struct {
 	// Nonempty options use one history stream to preserve Git's selection and
 	// diff semantics, independently of detection concurrency.
 	LogOpts string
+	// Workers limits concurrent history processes. Zero defaults to
+	// min(GOMAXPROCS, 4); explicit LogOpts still use one history stream.
+	Workers int
+	// NoMergePatches suppresses patches for merge commits while retaining
+	// traversal of all parents and explicitly requested commit messages.
+	// It overrides merge-diff options in LogOpts. The default includes patches.
+	NoMergePatches bool
 	// Include adds resources to the default patch scan. Supported values:
 	// commit-messages, tag-messages, reflogs. Additional resources require
 	// GitHistory mode.
@@ -75,10 +80,16 @@ const (
 
 // Validate checks Git inputs and additional resource selections before scanning.
 func (s *Git) Validate() error {
+	if s.Workers < 0 || s.Workers > 16 {
+		return errors.New("Git history workers must be between 0 and 16")
+	}
 	switch s.Mode {
 	case GitHistory, GitStaged, GitWorkingTree:
 	default:
 		return fmt.Errorf("unknown Git mode %q", s.Mode)
+	}
+	if s.Mode != GitHistory && s.NoMergePatches {
+		return errors.New("NoMergePatches requires a Git history scan")
 	}
 	if s.Mode != GitHistory && (s.URL != "" || s.LogOpts != "" || len(s.Include) > 0) {
 		return errors.New("Git diff modes require a local repository and cannot use LogOpts or Include")
@@ -110,7 +121,7 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 			local.URL, local.Token, local.RepoPath = "", "", repo
 			u, _ := parseHTTPSource(s.URL)
 			if local.Platform == scm.UnknownPlatform {
-				local.Platform = platformFromHost(u)
+				local.Platform = scm.PlatformFromHost(u.Hostname())
 			}
 			local.RemoteURL = strings.TrimSuffix(urlredact.Public(u), ".git")
 			return local.Fragments(ctx, yield)
@@ -144,7 +155,7 @@ func (s *Git) Fragments(ctx context.Context, yield FragmentsFunc) error {
 	return nil
 }
 
-// fragmentsFromRepo uses at most four history processes to limit retained buffers.
+// fragmentsFromRepo defaults to at most four history processes to limit retained buffers.
 // Each process consumes fragments serially; the detector provides the other
 // half of the bounded worker pipeline.
 func (s *Git) fragmentsFromRepo(ctx context.Context, yield FragmentsFunc) error {
@@ -153,7 +164,10 @@ func (s *Git) fragmentsFromRepo(ctx context.Context, yield FragmentsFunc) error 
 	if s.LogOpts != "" {
 		return s.runFullHistory(ctx, yield)
 	}
-	historyWorkers := min(max(runtime.GOMAXPROCS(0), 1), 4)
+	historyWorkers := s.Workers
+	if historyWorkers == 0 {
+		historyWorkers = min(max(runtime.GOMAXPROCS(0), 1), 4)
+	}
 
 	includeMessages := slices.Contains(s.Include, GitResourceTypeCommitMessages)
 	includeReflogs := slices.Contains(s.Include, GitResourceTypeReflogs)
@@ -161,7 +175,7 @@ func (s *Git) fragmentsFromRepo(ctx context.Context, yield FragmentsFunc) error 
 		return s.runFullHistory(ctx, yield)
 	}
 
-	commits, err := listCommits(ctx, s.RepoPath, s.LogOpts, includeReflogs)
+	commits, err := listCommits(ctx, s.RepoPath, s.LogOpts, includeReflogs, s.NoMergePatches)
 	if err != nil {
 		return fmt.Errorf("list commits: %w", err)
 	}
@@ -198,7 +212,7 @@ func (s *Git) runFullHistory(ctx context.Context, yield FragmentsFunc) error {
 	if includeReflogs {
 		logOpts = "--reflog " + logOpts
 	}
-	cmd, err := newGitLogCmd(ctx, s.RepoPath, logOpts, s.Logger)
+	cmd, err := newGitLogCmd(ctx, s.RepoPath, logOpts, s.NoMergePatches, s.Logger)
 	if err != nil {
 		return err
 	}
@@ -206,7 +220,7 @@ func (s *Git) runFullHistory(ctx context.Context, yield FragmentsFunc) error {
 		return err
 	}
 	if slices.Contains(s.Include, GitResourceTypeCommitMessages) {
-		commits, err := listCommits(ctx, s.RepoPath, s.LogOpts, includeReflogs)
+		commits, err := listCommits(ctx, s.RepoPath, s.LogOpts, includeReflogs, s.NoMergePatches)
 		if err != nil {
 			return fmt.Errorf("list commits: %w", err)
 		}
@@ -218,7 +232,7 @@ func (s *Git) runFullHistory(ctx context.Context, yield FragmentsFunc) error {
 }
 
 func (s *Git) runHistoryChunk(ctx context.Context, yield FragmentsFunc, commits []string) error {
-	cmd, err := newGitLogCommitsCmd(ctx, s.RepoPath, commits, s.Logger)
+	cmd, err := newGitLogCommitsCmd(ctx, s.RepoPath, commits, s.NoMergePatches, s.Logger)
 	if err != nil {
 		return err
 	}
@@ -746,7 +760,7 @@ func (br *blobReader) Close() error {
 	return waitErr
 }
 
-func newGitLogCmd(ctx context.Context, source, logOpts string, logger *slog.Logger) (*gitCmd, error) {
+func newGitLogCmd(ctx context.Context, source, logOpts string, noMergePatches bool, logger *slog.Logger) (*gitCmd, error) {
 	sourceClean := filepath.Clean(source)
 	args := []string{"-C", sourceClean, "log", "-p", "-U0", "--diff-merges=first-parent"}
 	if logOpts != "" {
@@ -764,6 +778,11 @@ func newGitLogCmd(ctx context.Context, source, logOpts string, logger *slog.Logg
 	optionsEnd := slices.Index(args, "--")
 	if optionsEnd < 0 {
 		optionsEnd = len(args)
+	}
+	if noMergePatches {
+		// The explicit source policy wins over user merge-diff formatting,
+		// without treating options after "--" as anything other than paths.
+		args = slices.Insert(args, optionsEnd, "--diff-merges=off")
 	}
 	args = slices.Insert(args, optionsEnd, "--format=medium", "--no-abbrev-commit")
 	return startGitCmd(exec.CommandContext(ctx, "git", args...), logger)
@@ -933,9 +952,12 @@ func listenForStdErr(stderr io.ReadCloser, errCh chan<- error, logger *slog.Logg
 
 // newGitLogCommitsCmd constructs a git log command for an exact set of
 // commits. --no-walk keeps worker partitions deterministic and non-overlapping.
-func newGitLogCommitsCmd(ctx context.Context, source string, commits []string, logger *slog.Logger) (*gitCmd, error) {
+func newGitLogCommitsCmd(ctx context.Context, source string, commits []string, noMergePatches bool, logger *slog.Logger) (*gitCmd, error) {
 	sourceClean := filepath.Clean(source)
 	args := []string{"-C", sourceClean, "log", "-p", "-U0", "--diff-merges=first-parent", "--no-walk", "--stdin", "--diff-filter=tuxdb"}
+	if noMergePatches {
+		args = append(args, "--diff-merges=off")
+	}
 	// Match the preamble format used by the full-history scan, regardless of
 	// the repository's format.pretty configuration.
 	args = append(args, "--format=medium", "--no-abbrev-commit")
@@ -949,7 +971,7 @@ func newGitLogCommitsCmd(ctx context.Context, source string, commits []string, l
 // listCommits returns the commits selected by logOpts in deterministic order.
 // Reflog roots join the same walk as ordinary refs, so Git visits each commit
 // once even when multiple refs and reflog entries refer to it.
-func listCommits(ctx context.Context, source string, logOpts string, includeReflogs bool) ([]string, error) {
+func listCommits(ctx context.Context, source string, logOpts string, includeReflogs, noMergePatches bool) ([]string, error) {
 	sourceClean := filepath.Clean(source)
 	// Keep diff-based selection (such as -G) consistent with the patch scan,
 	// including changes introduced by merges. This does not limit traversal.
@@ -972,6 +994,9 @@ func listCommits(ctx context.Context, source string, logOpts string, includeRefl
 	optionsEnd := slices.Index(args, "--")
 	if optionsEnd < 0 {
 		optionsEnd = len(args)
+	}
+	if noMergePatches {
+		args = slices.Insert(args, optionsEnd, "--diff-merges=off")
 	}
 	args = slices.Insert(args, optionsEnd, "--format=%H", "--no-patch", "--no-abbrev-commit", "--no-color", "--no-decorate")
 
@@ -1004,17 +1029,11 @@ func ResolveRemote(ctx context.Context, platform scm.Platform, source string) (s
 		return platform, ""
 	}
 
-	if platform == scm.UnknownPlatform {
-		platform = platformFromHost(remoteUrl)
-	}
-
-	return platform, remoteUrl.String()
+	return scm.ResolveRemoteURL(platform, remoteUrl)
 }
 
-var sshUrlpat = regexp.MustCompile(`^git@([a-zA-Z0-9.-]+):(?:\d{1,5}/)?([\w/.-]+?)(?:\.git)?$`)
-
-func getRemoteUrl(ctx context.Context, source string) (*url.URL, error) {
-	// This will return the first remote — typically, "origin".
+func getRemoteUrl(ctx context.Context, source string) (string, error) {
+	// Git selects the current branch's fetch remote, the sole remote, or origin.
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--quiet", "--get-url")
 	cmd.Env = gitConfigIsolationEnv()
 	if source != "." {
@@ -1025,40 +1044,9 @@ func getRemoteUrl(ctx context.Context, source string) (*url.URL, error) {
 	if err != nil {
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
-			return nil, fmt.Errorf("command failed (%d): %w, stderr: %s", exitError.ExitCode(), err, string(bytes.TrimSpace(exitError.Stderr)))
+			return "", fmt.Errorf("command failed (%d): %w, stderr: %s", exitError.ExitCode(), err, string(bytes.TrimSpace(exitError.Stderr)))
 		}
-		return nil, err
+		return "", err
 	}
-
-	remoteUrl := string(bytes.TrimSpace(stdout))
-	if matches := sshUrlpat.FindStringSubmatch(remoteUrl); matches != nil {
-		remoteUrl = fmt.Sprintf("https://%s/%s", matches[1], matches[2])
-	}
-	remoteUrl = strings.TrimSuffix(remoteUrl, ".git")
-
-	parsedUrl, err := url.Parse(remoteUrl)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse remote URL: %w", err)
-	}
-
-	// Remove any user info.
-	parsedUrl.User = nil
-	return parsedUrl, nil
-}
-
-func platformFromHost(u *url.URL) scm.Platform {
-	switch strings.ToLower(u.Hostname()) {
-	case "github.com":
-		return scm.GitHubPlatform
-	case "gitlab.com":
-		return scm.GitLabPlatform
-	case "dev.azure.com", "visualstudio.com":
-		return scm.AzureDevOpsPlatform
-	case "gitea.com", "code.forgejo.org", "codeberg.org":
-		return scm.GiteaPlatform
-	case "bitbucket.org":
-		return scm.BitbucketPlatform
-	default:
-		return scm.UnknownPlatform
-	}
+	return string(bytes.TrimSpace(stdout)), nil
 }
