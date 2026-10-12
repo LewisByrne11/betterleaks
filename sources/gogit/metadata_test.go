@@ -164,3 +164,57 @@ func FuzzParseReflog(f *testing.F) {
 		}
 	})
 }
+
+//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
+func TestReflogHistoryIsAdditive(t *testing.T) {
+	repo := newHistory(t)
+	base := gitFixture(t, repo, "rev-parse", "HEAD")
+	file := filepath.Join(repo, "renamed.txt")
+	content := "first\nTOKEN_CHANGED\nlast\nABANDONED_ADDITION\n"
+	require.NoError(t, os.WriteFile(file, []byte(content), 0600))
+	gitFixture(t, repo, "add", "renamed.txt")
+	t.Setenv("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")
+	gitFixture(t, repo, "commit", "-qm", "abandoned")
+	abandoned := gitFixture(t, repo, "rev-parse", "HEAD")
+	gitFixture(t, repo, "reset", "--hard", base)
+	t.Setenv("PATH", t.TempDir())
+	for _, tc := range []struct {
+		name            string
+		maxCount        int
+		rejectAbandoned bool
+	}{
+		{"defaults", 0, false},
+		{"prefilter", 0, true},
+		{"count limit", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Source{RepoPath: repo, All: true, MaxCount: tc.maxCount}
+			if tc.rejectAbandoned {
+				s.Prefilter = func(attrs map[string]string) bool { return attrs[sources.AttrGitSHA] == abandoned }
+			}
+			baseline := collect(t, s)
+			foundLoose := false
+			for _, f := range baseline {
+				foundLoose = foundLoose || (f.Attr(sources.AttrResource) == sources.ResourceGitLooseBlob && f.Raw == content)
+			}
+			require.True(t, foundLoose, "baseline scans the complete abandoned loose blob")
+			s.Include = []string{"reflog-history"}
+			expanded := collect(t, s)
+			for _, f := range baseline {
+				require.Contains(t, expanded, f, "adding reflog history must retain each default fragment")
+			}
+			additions := 0
+			for _, f := range expanded {
+				if f.Attr(sources.AttrGitSHA) == abandoned {
+					additions++
+					require.Equal(t, "ABANDONED_ADDITION\n", f.Raw)
+				}
+			}
+			if !tc.rejectAbandoned && tc.maxCount == 0 {
+				require.Equal(t, 1, additions)
+			} else {
+				require.Zero(t, additions)
+			}
+		})
+	}
+}

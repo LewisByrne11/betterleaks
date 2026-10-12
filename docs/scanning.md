@@ -668,8 +668,13 @@ numbers are relative to the message. A reflog actor/time is not commit authorshi
 or the time a secret was introduced or pushed.
 
 `--include=reflog-history` adds both old and new reflog IDs as history roots,
-including linked worktrees' journals. Commits shared with ordinary history are
-scanned once. Date/identity/count filters apply to the actual commits; `--revision`
+including linked worktrees' journals. Ordinary history is scanned first, then
+additional reflog commits, using one visited set and one `--max-count` budget.
+Shared commits are scanned once; a count limit gives ordinary history priority.
+Adding reflog history preserves the default loose-blob scan: added-line patches
+do not replace whole-blob coverage. An abandoned loose blob can therefore produce
+both a full-blob finding and a commit-attributed patch finding. Date/identity/count
+filters apply to the actual commits; `--revision`
 does not restrict these additional roots. Excluding `history` selects only
 reflog-rooted history; enabled `commit-messages` then uses that same selection.
 Reflogs for notes refs can also retain note-edit commits; their tree additions

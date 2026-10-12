@@ -180,6 +180,16 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	} else if resources[sources.GitResourceTypeReflogHistory] {
 		walk = &history{r: r, seen: make(map[plumbing.Hash]struct{}), frontier: nil, sequence: 0}
 	}
+	// Finish ordinary history first. Its loose-object exclusions must not
+	// depend on optional reflog coverage: a patch scans additions, whereas the
+	// supplemental loose pass scans whole blobs, including inherited content.
+	selected := 0
+	if walk != nil && len(walk.frontier) > 0 {
+		selected, err = resolved.commits(ctx, r, walk, loose, yield)
+		if err != nil {
+			return err
+		}
+	}
 	if resources[sources.GitResourceTypeReflogHistory] || resources[sources.GitResourceTypeReflogMessages] {
 		var tips *history
 		if resources[sources.GitResourceTypeReflogHistory] {
@@ -189,8 +199,15 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			return err
 		}
 	}
-	if walk != nil {
-		if err := resolved.commits(ctx, r, walk, loose, yield); err != nil {
+	if resources[sources.GitResourceTypeReflogHistory] && (s.MaxCount == 0 || selected < s.MaxCount) {
+		// Reuse the visited set, but do not let the added patches suppress any
+		// default loose-blob fragments. Keep one count budget across both passes,
+		// giving ordinary history priority so --include cannot displace it.
+		extra := resolved
+		if extra.MaxCount > 0 {
+			extra.MaxCount -= selected
+		}
+		if _, err := extra.commits(ctx, r, walk, nil, yield); err != nil {
 			return err
 		}
 	}
@@ -207,7 +224,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	return resolved.looseBlobs(ctx, store, loose, yield)
 }
 
-func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, loose *looseObjects, yield sources.FragmentsFunc) error {
+func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, loose *looseObjects, yield sources.FragmentsFunc) (int, error) {
 	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
@@ -241,9 +258,9 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 			}
 		})
 	}
+	selected := 0
 	group.Go(func() error {
 		defer close(jobs)
-		selected := 0
 		for s.MaxCount == 0 || selected < s.MaxCount {
 			if err := workCtx.Err(); err != nil {
 				return err
@@ -271,7 +288,7 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 	if s.Logger != nil {
 		s.Logger.Debug("git text patch cache", "hits", patches.hits, "misses", patches.misses, "entries", len(patches.entries), "bytes", patches.bytes)
 	}
-	return err
+	return selected, err
 }
 
 func (s *Source) selector() func(*object.Commit) bool {
