@@ -783,7 +783,7 @@ func TestGitResourceSelection(t *testing.T) {
 		s.RepoPath = repo
 		require.Error(t, s.Validate())
 	}
-	for _, resource := range []string{"history", "loose-objects", "notes", "commit-messages"} {
+	for _, resource := range []string{"history", "merges", "loose-objects", "notes", "commit-messages"} {
 		s := &Source{RepoPath: repo, Include: []string{resource}, Exclude: []string{resource}}
 		require.ErrorContains(t, s.Validate(), "both included and excluded")
 	}

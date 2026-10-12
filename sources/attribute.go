@@ -18,6 +18,7 @@ const (
 	GitResourceTypeCommitMessages = "commit-messages"
 	GitResourceTypeNotes          = "notes"
 	GitResourceTypeHistory        = "history"
+	GitResourceTypeMerges         = "merges"
 	GitResourceTypeLooseObjects   = "loose-objects"
 	ResourceGitPatchContent       = "git.patch_content"
 	ResourceGitCommitMessage      = "git.commit_message"

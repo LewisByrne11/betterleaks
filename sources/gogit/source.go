@@ -24,8 +24,9 @@ import (
 
 // Source scans HEAD's reachable history by default. Merges are compared against
 // their first parent. Include adds resources to the defaults (history and
-// loose-objects); Exclude removes resources. Conflicts and empty selections
-// are rejected. Supplemental loose blobs have no path or commit attribution.
+// loose-objects, with merge patches enabled); Exclude removes resources.
+// Conflicts and empty selections are rejected. Supplemental loose blobs have
+// no path or commit attribution.
 // Diff boundaries and rename choices can differ from Git's xdiff implementation.
 // Traversal retains one visited object ID per discovered commit, not every
 // decoded commit. Worker queues and object/tree caches have separate bounds.
@@ -36,8 +37,6 @@ type Source struct {
 	URL, Token string
 	Revision   string
 	All        bool
-	// NoMergePatches matches plain git log -p's suppression of merge patches.
-	NoMergePatches bool
 	// Since and Until filter committer time inclusively, without pruning ancestors
 	// based on timestamps. Non-monotonic history therefore remains traversable.
 	Since, Until *time.Time
@@ -58,7 +57,7 @@ type Source struct {
 	// error, rather than silently omitting content. It bounds diff inputs, not
 	// go-git's internal delta reconstruction or the process's complete RSS.
 	MaxBlobBytes int64
-	// Include and Exclude accept history, loose-objects, commit-messages, notes.
+	// Include and Exclude accept history, merges, loose-objects, commit-messages, notes.
 	Include, Exclude []string
 	Prefilter        sources.PrefilterFunc
 	MaxArchiveDepth  int
@@ -97,6 +96,7 @@ func (s *Source) Validate() error {
 func (s *Source) resources() (map[string]bool, error) {
 	selected := map[string]bool{
 		sources.GitResourceTypeHistory:        true,
+		sources.GitResourceTypeMerges:         true,
 		sources.GitResourceTypeLooseObjects:   true,
 		sources.GitResourceTypeCommitMessages: false,
 		sources.GitResourceTypeNotes:          false,
@@ -104,7 +104,7 @@ func (s *Source) resources() (map[string]bool, error) {
 	for _, list := range [][]string{s.Include, s.Exclude} {
 		for _, name := range list {
 			if _, known := selected[name]; !known {
-				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, loose-objects, commit-messages, notes", name)
+				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, merges, loose-objects, commit-messages, notes", name)
 			}
 		}
 	}
@@ -116,6 +116,13 @@ func (s *Source) resources() (map[string]bool, error) {
 	}
 	for _, name := range s.Exclude {
 		selected[name] = false
+	}
+	// Merge patches are part of history, not an independent traversal.
+	if !selected[sources.GitResourceTypeHistory] {
+		if slices.Contains(s.Include, sources.GitResourceTypeMerges) {
+			return nil, errors.New("including merges requires history; remove history from --exclude")
+		}
+		selected[sources.GitResourceTypeMerges] = false
 	}
 	for _, enabled := range selected {
 		if enabled {
@@ -291,7 +298,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 			}
 		}
 	}
-	if slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) || (w.source.NoMergePatches && len(c.ParentHashes) > 1) {
+	if slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) || (slices.Contains(w.source.Exclude, sources.GitResourceTypeMerges) && len(c.ParentHashes) > 1) {
 		return nil
 	}
 	changes, err := treeChanges(ctx, c, w.trees)

@@ -86,7 +86,7 @@ betterleaks fs /path/to/target -a
 betterleaks git /path/to/repo
 
 # Suppress merge commit patches while still traversing both parents
-betterleaks git /path/to/repo --include-merges=false
+betterleaks git /path/to/repo --exclude=merges
 
 # Automatically detect a remote repository and scan its history
 betterleaks https://github.com/betterleaks/betterleaks

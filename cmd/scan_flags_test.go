@@ -524,18 +524,15 @@ func TestGitWorkerFlagSelectsSourceConcurrency(t *testing.T) {
 
 func TestGitMergeOptionValidation(t *testing.T) {
 	for _, args := range [][]string{
-		{"git", "--include-merges", "--no-merge-patches"},
-		{"git", "--include-merges=true", "--no-merge-patches"},
-		{"git", "--staged", "--include-merges=false"},
-		{"git", "--unstaged", "--include-merges"},
-		{"git", "--staged", "--no-merge-patches"},
+		{"git", "--include=merges", "--exclude=merges"},
+		{"git", "--include=merges", "--exclude=history"},
 	} {
 		_, err := parseCLIForTest(t, args...)
 		require.Error(t, err, "%v", args)
 	}
-	cli, err := parseCLIForTest(t, "git", "--include-merges=false", "--no-merge-patches")
+	cli, err := parseCLIForTest(t, "git", "--exclude=merges")
 	require.NoError(t, err)
-	require.True(t, cli.Git.skipMergePatches())
+	require.Equal(t, []string{"merges"}, cli.Git.Exclude)
 }
 
 func TestExpandRuleFlagShorthands(t *testing.T) {

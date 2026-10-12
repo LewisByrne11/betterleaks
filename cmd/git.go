@@ -19,21 +19,19 @@ type GitCmd struct {
 	MaxArchiveDepth int      `group:"scanning" name:"max-archive-depth" default:"8" help:"Allow scanning into nested archives up to this depth."`
 	Token           string   `group:"source" help:"Token for an HTTP(S) clone (or the known host's GITHUB_TOKEN, GITLAB_TOKEN, HUGGINGFACE_TOKEN/HF_TOKEN)."`
 	Platform        string   `group:"source" help:"Target platform used to generate links: github or gitlab."`
-	IncludeMerges   *bool    `group:"source" name:"include-merges" help:"Scan merge commit patches against the first parent (default true). Use --include-merges=false to suppress merge patches; both parents' histories remain included."`
 	Since           string   `group:"source" help:"Minimum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
 	Until           string   `group:"source" help:"Maximum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
 	Author          string   `group:"source" help:"Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"Go regular expression matching committer name and email."`
 	Revision        string   `group:"source" help:"Starting revision; when omitted, scans all refs."`
 	All             bool     `group:"source" help:"Scan history reachable from all refs (default unless --revision is set)."`
-	NoMergePatches  bool     `group:"source" name:"no-merge-patches" hidden:"" help:"Alias for --include-merges=false."`
 	MaxCount        int      `group:"source" name:"max-count" help:"Maximum selected commits; zero is unlimited."`
 	GitWorkers      int      `group:"source" name:"git-workers" help:"Concurrent history readers (default up to 8; maximum 16)."`
 	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"Cached object content in MiB; zero uses 256 MiB. This is not a process memory limit."`
 	GitDiskCacheMiB int      `group:"source" name:"git-disk-cache-mib" help:"Temporary object cache in MiB; zero uses 1024 MiB, -1 disables. Removed after scanning."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Maximum diff input size; exceeding it reports an incomplete scan."`
-	Exclude         []string `group:"source" help:"Remove Git resources: history, loose-objects, commit-messages, notes."`
-	Include         []string `group:"source" help:"Add Git resources: history, loose-objects, commit-messages, notes (defaults: history, loose-objects)."`
+	Exclude         []string `group:"source" help:"Remove Git resources: history, merges, loose-objects, commit-messages, notes."`
+	Include         []string `group:"source" help:"Add Git resources: history, merges, loose-objects, commit-messages, notes (defaults: history with merges, loose-objects)."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
 }
 
@@ -43,9 +41,6 @@ func (cmd GitCmd) Validate() error {
 	}
 	if cmd.GitWorkers < 0 || cmd.GitWorkers > 16 {
 		return errors.New("--git-workers must be between 0 and 16")
-	}
-	if cmd.NoMergePatches && cmd.IncludeMerges != nil && *cmd.IncludeMerges {
-		return errors.New("--include-merges=true cannot be combined with --no-merge-patches")
 	}
 	src, err := cmd.gitSource()
 	if err != nil {
@@ -154,13 +149,9 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 			token = remoteGitToken(url)
 		}
 	}
-	return &gogit.Source{RepoPath: repo, URL: url, Token: token, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", NoMergePatches: cmd.skipMergePatches(), Since: since, Until: until,
+	return &gogit.Source{RepoPath: repo, URL: url, Token: token, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", Since: since, Until: until,
 		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB, DiskCacheMiB: cmd.GitDiskCacheMiB,
 		Prefilter: nil, Logger: nil, RemoteURL: "", MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
-}
-
-func (cmd GitCmd) skipMergePatches() bool {
-	return cmd.NoMergePatches || (cmd.IncludeMerges != nil && !*cmd.IncludeMerges)
 }
 
 // An existing path wins even when its spelling resembles a URL.

@@ -120,7 +120,9 @@ helper-disabling flags and pipeline error handling. `--include=commit-messages,n
 adds message resources. Loose blobs are included by default; disable them with
 `--exclude=loose-objects` for a strict history selection. To scan only messages,
 use `--include=commit-messages --exclude=history,loose-objects`. `--include` is
-additive; it never selects an exclusive scan by itself.
+additive; it never selects an exclusive scan by itself. The standalone
+`--include-merges` and `--no-merge-patches` flags are replaced by
+`--include=merges` and `--exclude=merges`; merge patches remain enabled by default.
 
 You can now omit the command for a path or supported remote URL:
 

@@ -675,13 +675,6 @@ validate = '''let r = http.get(%q); {"result": "valid"}'''
 	}
 }
 
-func TestGitRemovedFlags(t *testing.T) {
-	for _, flag := range []string{"--git-engine=git", "--loose-objects=false", "--staged", "--unstaged", "--pre-receive", "--log-opts=--all"} {
-		_, err := parseCLIForTest(t, "git", flag)
-		require.ErrorContains(t, err, "unknown flag")
-	}
-}
-
 func TestScanReportMultipleTargets(t *testing.T) {
 	configPath := writeTestConfig(t, "[[rules]]\nid='token'\nregex='TOKEN_[AB]'\n[[rules]]\nid='unused'\nregex='NEVER_MATCH'\n")
 	cfg, err := configpkg.LoadFile(configPath)

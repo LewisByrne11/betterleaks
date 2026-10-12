@@ -166,10 +166,8 @@ func TestGitIncludeMerges(t *testing.T) {
 			wantMerge bool
 		}{
 			{"default", "", true},
-			{"enabled", "--include-merges", true},
-			{"explicit true", "--include-merges=true", true},
-			{"disabled", "--include-merges=false", false},
-			{"legacy alias", "--no-merge-patches", false},
+			{"included", "--include=merges", true},
+			{"excluded", "--exclude=merges", false},
 		} {
 			t.Run(fmt.Sprintf("workers=%d/%s", workers, tc.name), func(t *testing.T) {
 				root, stdout := newTestCLI(t)

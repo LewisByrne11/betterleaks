@@ -565,7 +565,7 @@ The Git source reads objects directly using go-git and the bounded pack reader.
 It never executes Git, hooks, diff helpers, filters, SSH, or credential helpers.
 The CLI scans history reachable from all refs by default, comparing each commit
 with its first parent and scanning added lines. Both parents' histories are
-visited. `--include-merges=false` suppresses merge patches; it does not remove
+visited. `--exclude=merges` suppresses merge patches; it does not remove
 parent history or selected commit messages. Diff boundaries and rename choices
 can differ from Git's implementation.
 
@@ -585,6 +585,7 @@ to scan are errors.
 | Resource | Content | Default |
 |---|---|---|
 | `history` | Added file content across selected commits, from packed or loose objects | On |
+| `merges` | Merge patches against the first parent, within `history` | On with history |
 | `loose-objects` | Supplemental loose blobs without path or commit attribution | On |
 | `commit-messages` | Full messages of selected commits | Off |
 | `notes` | Historical note contents, including versions subsequently removed | Off |
@@ -592,12 +593,18 @@ to scan are errors.
 | Desired scan | Flags |
 |---|---|
 | History only | `--exclude=loose-objects` |
+| History without merge patches | `--exclude=merges,loose-objects` |
 | Add messages to the default scan | `--include=commit-messages` |
 | Everything | `--include=commit-messages,notes` |
 | Messages only | `--include=commit-messages --exclude=history,loose-objects` |
 | Notes only | `--include=notes --exclude=history,loose-objects` |
 | Messages and notes only | `--include=commit-messages,notes --exclude=history,loose-objects` |
 | Loose blobs only | `--exclude=history` |
+
+`merges` controls patches within `history`; excluding history also disables
+merge patches. Explicitly including `merges` while excluding `history` is an
+error. Excluding `merges` preserves both parents' histories and any enabled
+commit-message scanning, including merge commit messages.
 
 Messages-only scans do not compare file trees or read file blobs. Notes-only
 and loose-only scans do not traverse ordinary commit history. When history is
