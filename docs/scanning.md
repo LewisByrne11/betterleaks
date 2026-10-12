@@ -585,24 +585,30 @@ to scan are errors.
 | Resource | Content | Default |
 |---|---|---|
 | `history` | Added file content across selected commits, from packed or loose objects | On |
-| `merges` | Merge patches against the first parent, within `history` | On with history |
+| `merges` | Merge patches against the first parent, within either history resource | On with history |
 | `loose-objects` | Supplemental loose blobs without path or commit attribution | On |
 | `commit-messages` | Full messages of selected commits | Off |
 | `notes` | Historical note contents, including versions subsequently removed | Off |
+| `tag-messages` | Annotated-tag messages, including nested annotations | Off |
+| `reflog-messages` | Local ref-update journal messages | Off |
+| `reflog-history` | Added file content in commits retained by local reflogs, including abandoned history | Off |
 
 | Desired scan | Flags |
 |---|---|
 | History only | `--exclude=loose-objects` |
 | History without merge patches | `--exclude=merges,loose-objects` |
 | Add messages to the default scan | `--include=commit-messages` |
-| Everything | `--include=commit-messages,notes` |
+| All supported resources | `--include=commit-messages,notes,tag-messages,reflog-messages,reflog-history` |
 | Messages only | `--include=commit-messages --exclude=history,loose-objects` |
 | Notes only | `--include=notes --exclude=history,loose-objects` |
 | Messages and notes only | `--include=commit-messages,notes --exclude=history,loose-objects` |
 | Loose blobs only | `--exclude=history` |
+| Tag messages only | `--include=tag-messages --exclude=history,loose-objects` |
+| Reflog messages only | `--include=reflog-messages --exclude=history,loose-objects` |
+| Include abandoned local history | `--include=reflog-history` |
 
-`merges` controls patches within `history`; excluding history also disables
-merge patches. Explicitly including `merges` while excluding `history` is an
+`merges` controls patches within `history` and `reflog-history`. If neither is
+selected, merge patches are disabled; explicitly including `merges` then is an
 error. Excluding `merges` preserves both parents' histories and any enabled
 commit-message scanning, including merge commit messages.
 
@@ -644,6 +650,41 @@ note commits; `--revision` selects ordinary history and commit messages, not not
 versions are scanned in full and may repeat unchanged text across edits.
 Without `--include=notes`, loose note blobs may still be found as unattributed
 loose content. Notes refs are excluded from ordinary file history.
+
+
+`--include=tag-messages` reads all local `refs/tags/*` annotations. Lightweight
+tags have no message. Findings use `resource=git.tag_message` and identify the tag object (`git.tag_sha`), its target
+(`git.tag_target`), tagger identity/time, and the ref through which it was found
+(`git.tag_source_ref`). Only the outer annotation has `git.tag_ref` and a tag-page
+link; a nested annotation need not have a ref of its own. Tag IDs are not reported
+as commit IDs. Aliased tags are scanned per ref so ref-dependent filters work.
+
+Reflogs are **local journals of ref updates**, such as commits, resets, rebases,
+and branch switches. They can retain commits no longer reachable from branches
+or tags. `--include=reflog-messages` scans the journal text itself, with
+`resource=git.reflog_message`, `git.reflog_ref`, actor name/email, update time
+(`git.reflog_date`), old/new object IDs, and log path/record number. Snippet line
+numbers are relative to the message. A reflog actor/time is not commit authorship
+or the time a secret was introduced or pushed.
+
+`--include=reflog-history` adds both old and new reflog IDs as history roots,
+including linked worktrees' journals. Commits shared with ordinary history are
+scanned once. Date/identity/count filters apply to the actual commits; `--revision`
+does not restrict these additional roots. Excluding `history` selects only
+reflog-rooted history; enabled `commit-messages` then uses that same selection.
+Reflogs for notes refs can also retain note-edit commits; their tree additions
+appear as ordinary patches in this broad history traversal.
+
+Tag and reflog messages are independent of commit date/identity/count filters
+and `--revision`; source attribute filters can select them. Neither message-only
+pass compares file trees. Reflog records are streamed with a 1 MiB per-record
+limit and a 64-level directory-depth limit; unsupported links, malformed or
+truncated records, and missing history objects report incomplete coverage.
+Missing journals are normal. Reflogs expire, may be disabled, and are not fetched
+from remotes. These resources cannot recover garbage-collected content or
+unreachable packed objects absent from both refs and reflogs. Scan a stable
+repository when possible: concurrent ref updates or garbage collection can
+invalidate a scan.
 
 HTTP(S) repositories are fetched directly in Go into a temporary mirror, without
 a checkout or submodules, and removed after scanning. `--token` supplies HTTPS

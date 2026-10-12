@@ -18,6 +18,7 @@ import (
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
 	git "github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"golang.org/x/sync/errgroup"
 )
@@ -57,7 +58,8 @@ type Source struct {
 	// error, rather than silently omitting content. It bounds diff inputs, not
 	// go-git's internal delta reconstruction or the process's complete RSS.
 	MaxBlobBytes int64
-	// Include and Exclude accept history, merges, loose-objects, commit-messages, notes.
+	// Include and Exclude accept history, merges, loose-objects, commit-messages,
+	// notes, tag-messages, reflog-messages, and reflog-history.
 	Include, Exclude []string
 	Prefilter        sources.PrefilterFunc
 	MaxArchiveDepth  int
@@ -100,11 +102,14 @@ func (s *Source) resources() (map[string]bool, error) {
 		sources.GitResourceTypeLooseObjects:   true,
 		sources.GitResourceTypeCommitMessages: false,
 		sources.GitResourceTypeNotes:          false,
+		sources.GitResourceTypeTagMessages:    false,
+		sources.GitResourceTypeReflogMessages: false,
+		sources.GitResourceTypeReflogHistory:  false,
 	}
 	for _, list := range [][]string{s.Include, s.Exclude} {
 		for _, name := range list {
 			if _, known := selected[name]; !known {
-				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, merges, loose-objects, commit-messages, notes", name)
+				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, merges, loose-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history", name)
 			}
 		}
 	}
@@ -118,9 +123,9 @@ func (s *Source) resources() (map[string]bool, error) {
 		selected[name] = false
 	}
 	// Merge patches are part of history, not an independent traversal.
-	if !selected[sources.GitResourceTypeHistory] {
+	if !selected[sources.GitResourceTypeHistory] && !selected[sources.GitResourceTypeReflogHistory] {
 		if slices.Contains(s.Include, sources.GitResourceTypeMerges) {
-			return nil, errors.New("including merges requires history; remove history from --exclude")
+			return nil, errors.New("including merges requires history or reflog-history")
 		}
 		selected[sources.GitResourceTypeMerges] = false
 	}
@@ -155,7 +160,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	// Source can be scanned concurrently.
 	resolved := *s
 	resources, _ := s.resources() // Validate already checked the selection.
-	if resources[sources.GitResourceTypeHistory] || resources[sources.GitResourceTypeCommitMessages] {
+	if resources[sources.GitResourceTypeHistory] || resources[sources.GitResourceTypeCommitMessages] || resources[sources.GitResourceTypeReflogHistory] || resources[sources.GitResourceTypeTagMessages] {
 		resolved.Platform, resolved.RemoteURL = s.resolveRemote(r)
 	}
 	store := r.Storer.(*objectStorage)
@@ -166,8 +171,31 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			return err
 		}
 	}
-	if resources[sources.GitResourceTypeHistory] || resources[sources.GitResourceTypeCommitMessages] {
-		if err := resolved.commits(ctx, r, loose, yield); err != nil {
+	var walk *history
+	if resources[sources.GitResourceTypeHistory] || (resources[sources.GitResourceTypeCommitMessages] && !resources[sources.GitResourceTypeReflogHistory]) {
+		walk, err = resolved.history(ctx, r)
+		if err != nil {
+			return err
+		}
+	} else if resources[sources.GitResourceTypeReflogHistory] {
+		walk = &history{r: r, seen: make(map[plumbing.Hash]struct{}), frontier: nil, sequence: 0}
+	}
+	if resources[sources.GitResourceTypeReflogHistory] || resources[sources.GitResourceTypeReflogMessages] {
+		var tips *history
+		if resources[sources.GitResourceTypeReflogHistory] {
+			tips = walk
+		}
+		if err := resolved.reflogs(ctx, store, tips, resources[sources.GitResourceTypeReflogMessages], yield); err != nil {
+			return err
+		}
+	}
+	if walk != nil {
+		if err := resolved.commits(ctx, r, walk, loose, yield); err != nil {
+			return err
+		}
+	}
+	if resources[sources.GitResourceTypeTagMessages] {
+		if err := resolved.tagMessages(ctx, r, yield); err != nil {
 			return err
 		}
 	}
@@ -179,11 +207,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	return resolved.looseBlobs(ctx, store, loose, yield)
 }
 
-func (s *Source) commits(ctx context.Context, r *git.Repository, loose *looseObjects, yield sources.FragmentsFunc) error {
-	history, err := s.history(ctx, r)
-	if err != nil {
-		return err
-	}
+func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, loose *looseObjects, yield sources.FragmentsFunc) error {
 	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
@@ -243,7 +267,7 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, loose *looseObj
 		}
 		return nil
 	})
-	err = group.Wait()
+	err := group.Wait()
 	if s.Logger != nil {
 		s.Logger.Debug("git text patch cache", "hits", patches.hits, "misses", patches.misses, "entries", len(patches.entries), "bytes", patches.bytes)
 	}
@@ -298,7 +322,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 			}
 		}
 	}
-	if slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) || (slices.Contains(w.source.Exclude, sources.GitResourceTypeMerges) && len(c.ParentHashes) > 1) {
+	if (slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) && !slices.Contains(w.source.Include, sources.GitResourceTypeReflogHistory)) || (slices.Contains(w.source.Exclude, sources.GitResourceTypeMerges) && len(c.ParentHashes) > 1) {
 		return nil
 	}
 	changes, err := treeChanges(ctx, c, w.trees)

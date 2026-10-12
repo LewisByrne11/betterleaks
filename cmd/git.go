@@ -30,8 +30,8 @@ type GitCmd struct {
 	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"Cached object content in MiB; zero uses 256 MiB. This is not a process memory limit."`
 	GitDiskCacheMiB int      `group:"source" name:"git-disk-cache-mib" help:"Temporary object cache in MiB; zero uses 1024 MiB, -1 disables. Removed after scanning."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Maximum diff input size; exceeding it reports an incomplete scan."`
-	Exclude         []string `group:"source" help:"Remove Git resources: history, merges, loose-objects, commit-messages, notes."`
-	Include         []string `group:"source" help:"Add Git resources: history, merges, loose-objects, commit-messages, notes (defaults: history with merges, loose-objects)."`
+	Exclude         []string `group:"source" help:"Remove Git resources: history, merges, loose-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history."`
+	Include         []string `group:"source" help:"Add Git resources: history, merges, loose-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history (defaults: history with merges, loose-objects)."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
 }
 
