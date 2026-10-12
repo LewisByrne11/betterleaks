@@ -50,8 +50,8 @@ func TestRemoteSelection(t *testing.T) {
 			if tc.rewrite {
 				gitFixture(t, repo, "config", "url.https://github.com/.insteadOf", "gh:")
 			}
-			if tc.explicit == "" && tc.platform != scm.NoPlatform {
-				_, remote := sources.ResolveRemote(t.Context(), tc.platform, repo)
+			if tc.explicit == "" && tc.platform != scm.NoPlatform && tc.want != "" {
+				_, remote := scm.ResolveRemoteURL(tc.platform, gitFixture(t, repo, "ls-remote", "--get-url"))
 				require.Equal(t, tc.want, remote, "Git subprocess remote selection")
 			}
 			t.Setenv("PATH", t.TempDir())

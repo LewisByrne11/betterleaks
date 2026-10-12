@@ -516,18 +516,16 @@ func TestRemovedWorkerFlagsAreRejected(t *testing.T) {
 }
 
 func TestGitWorkerFlagSelectsSourceConcurrency(t *testing.T) {
-	for _, engine := range []string{"git", "go-git"} {
-		cli, err := parseCLIForTest(t, "git", "--git-engine="+engine, "--git-workers=16")
-		require.NoError(t, err)
-		require.Equal(t, 16, cli.Git.GitWorkers)
-		require.Zero(t, cli.Git.Jobs, "source workers must not override detection concurrency")
-	}
+	cli, err := parseCLIForTest(t, "git", "--git-workers=16")
+	require.NoError(t, err)
+	require.Equal(t, 16, cli.Git.GitWorkers)
+	require.Zero(t, cli.Git.Jobs, "source workers must not override detection concurrency")
 }
 
 func TestGitMergeOptionValidation(t *testing.T) {
 	for _, args := range [][]string{
 		{"git", "--include-merges", "--no-merge-patches"},
-		{"git", "--git-engine=go-git", "--include-merges=true", "--no-merge-patches"},
+		{"git", "--include-merges=true", "--no-merge-patches"},
 		{"git", "--staged", "--include-merges=false"},
 		{"git", "--unstaged", "--include-merges"},
 		{"git", "--staged", "--no-merge-patches"},

@@ -76,7 +76,8 @@ expression. Scans never revoke credentials.
 Use this command in pre-commit hooks:
 
 ```sh
-betterleaks git --staged --redact
+set -o pipefail
+git diff --cached --no-ext-diff --no-textconv | betterleaks stdin --git-diff --redact
 ```
 
 ### Commands and flags
@@ -87,13 +88,13 @@ betterleaks git --staged --redact
 | `detect --source PATH` | `git PATH` |
 | `detect --no-git --source PATH` | `fs PATH` |
 | `detect --pipe` | `stdin` |
-| `protect --source PATH`, `git --pre-commit PATH` | `git --unstaged PATH` |
-| `protect --staged --source PATH` | `git --staged PATH` |
+| `protect --source PATH`, `git --pre-commit PATH` | Pipe `git diff` into `betterleaks stdin --git-diff` |
+| `protect --staged --source PATH` | Pipe `git diff --cached` into `betterleaks stdin --git-diff` |
 | `--validation` | `--validate` / `-v`; use `--analyze` / `-a` to also analyze identity and permissions. |
 | `--validation-status` | `--status` |
 | `--validation-workers`, `--validation-timeout`, `--validation-debug` | `--provider-workers`, `--provider-timeout`, `--provider-debug` |
 | `--validation-max-requests`, `--validation-rps`, `--validation-rps-rule`, `--validation-env-vars` | Corresponding `--provider-*` flags. |
-| `--git-workers` | Removed; sources choose their own I/O concurrency. Explicit `--log-opts` uses one history stream to preserve Git option semantics. `--jobs` / `-j` controls detection. |
+| `--git-workers` | Controls object history workers (default up to eight, maximum 16); `--jobs` controls detection. |
 | `--enable-rule` | `--isolate-rule` |
 | `--ignore-gitleaks-allow` | `--no-allow-signatures` |
 | `--gitleaks-ignore-path` / `-i` | `--ignore-file PATH`, naming the file itself. See the ignore-format change below. |
@@ -112,9 +113,14 @@ requests, not the entire scan. Use `--silent` / `-s` to suppress terminal findin
 and the banner while still writing an explicitly requested report. The old
 `-s` source-path shorthand is not retained.
 
-Git diff modes scan **added lines**: `--staged` reads the index relative to HEAD;
-`--unstaged` reads tracked working-tree changes relative to the index. They are
-mutually exclusive. Neither scans untracked files; use `fs` for those.
+Git history uses the object reader; `--git-engine`, `--log-opts`, `--staged`,
+`--unstaged`, and `--pre-receive` are removed. Pipe caller-selected patches into
+`stdin --git-diff` for those workflows. See [Git scanning](scanning.md#git) for
+helper-disabling flags and pipeline error handling. `--include=commit-messages,notes`
+adds message resources. Loose blobs are included by default; disable them with
+`--exclude=loose-objects` for a strict history selection. To scan only messages,
+use `--include=commit-messages --exclude=history,loose-objects`. `--include` is
+additive; it never selects an exclusive scan by itself.
 
 You can now omit the command for a path or supported remote URL:
 
@@ -421,8 +427,9 @@ func run() error {
 Source prefilters are explicit: compile `cfg.PrefilterExpr` and set the source's
 `Prefilter`. The scanner does not apply it for you. Archive depth, file-size
 limits, and symlink handling belong to sources; detection options belong to
-`scan.New`. Use `sources.Git{RepoPath: ".", Mode: sources.GitStaged}` for staged
-changes instead of constructing Git commands or sharing a detector semaphore.
+`scan.New`. Use `gogit.Source{RepoPath: ".", All: true}` for repository history.
+For staged changes, supply a caller-produced patch stream to
+`sources.GitDiff{Content: reader}`; Betterleaks does not execute Git.
 
 GitHub, GitLab, and Hugging Face resource selection uses `Include`/`Exclude`;
 the derived resource map is private. Configure a fresh source for each scan.

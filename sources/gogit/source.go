@@ -1,5 +1,6 @@
-// Package gogit scans local committed additions using go-git's object reader.
-// It never invokes Git, hooks, filters, diff helpers, or a network transport.
+// Package gogit scans committed additions using go-git's object reader.
+// It never invokes Git, hooks, filters, or diff helpers. URL scans fetch an
+// HTTP(S) mirror; local repository scans do not use a network transport.
 package gogit
 
 import (
@@ -16,20 +17,25 @@ import (
 
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
+	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"golang.org/x/sync/errgroup"
 )
 
 // Source scans HEAD's reachable history by default. Merges are compared against
-// their first parent, matching Betterleaks' existing Git source. Include can add commit-messages.
+// their first parent. Include adds resources to the defaults (history and
+// loose-objects); Exclude removes resources. Conflicts and empty selections
+// are rejected. Supplemental loose blobs have no path or commit attribution.
 // Diff boundaries and rename choices can differ from Git's xdiff implementation.
 // Traversal retains one visited object ID per discovered commit, not every
 // decoded commit. Worker queues and object/tree caches have separate bounds.
 // All settings are immutable while Fragments runs; calls can run independently.
 type Source struct {
 	RepoPath string
-	Revision string
-	All      bool
+	// URL scans a temporary HTTP(S) mirror. Mutually exclusive with RepoPath.
+	URL, Token string
+	Revision   string
+	All        bool
 	// NoMergePatches matches plain git log -p's suppression of merge patches.
 	NoMergePatches bool
 	// Since and Until filter committer time inclusively, without pruning ancestors
@@ -51,11 +57,12 @@ type Source struct {
 	// MaxBlobBytes defaults to 64 MiB. Exceeding it returns an incomplete-scan
 	// error, rather than silently omitting content. It bounds diff inputs, not
 	// go-git's internal delta reconstruction or the process's complete RSS.
-	MaxBlobBytes    int64
-	Include         []string
-	Prefilter       sources.PrefilterFunc
-	MaxArchiveDepth int
-	Logger          *slog.Logger
+	MaxBlobBytes int64
+	// Include and Exclude accept history, loose-objects, commit-messages, notes.
+	Include, Exclude []string
+	Prefilter        sources.PrefilterFunc
+	MaxArchiveDepth  int
+	Logger           *slog.Logger
 	// Platform and RemoteURL control finding links. By default they are resolved
 	// from the local repository's fetch remote without invoking Git. NoPlatform
 	// disables links; RemoteURL overrides the configured remote.
@@ -66,8 +73,8 @@ type Source struct {
 var _ sources.Source = (*Source)(nil)
 
 func (s *Source) Validate() error {
-	if s.RepoPath == "" {
-		return errors.New("go-git source requires a local repository path")
+	if (s.RepoPath == "") == (s.URL == "") {
+		return errors.New("git source requires either a local repository path or an HTTP(S) URL")
 	}
 	if s.Workers < 0 || s.Workers > 16 || s.CacheMiB < 0 || s.DiskCacheMiB < -1 || s.DiskCacheMiB > 4096 || s.MaxCount < 0 || s.MaxBlobBytes < 0 {
 		return errors.New("invalid go-git worker, cache, count, or blob limit")
@@ -83,12 +90,39 @@ func (s *Source) Validate() error {
 			return fmt.Errorf("invalid identity filter: %w", err)
 		}
 	}
-	for _, name := range s.Include {
-		if name != sources.GitResourceTypeCommitMessages {
-			return fmt.Errorf("go-git does not support resource %q; supported: commit-messages", name)
+	_, err := s.resources()
+	return err
+}
+
+func (s *Source) resources() (map[string]bool, error) {
+	selected := map[string]bool{
+		sources.GitResourceTypeHistory:        true,
+		sources.GitResourceTypeLooseObjects:   true,
+		sources.GitResourceTypeCommitMessages: false,
+		sources.GitResourceTypeNotes:          false,
+	}
+	for _, list := range [][]string{s.Include, s.Exclude} {
+		for _, name := range list {
+			if _, known := selected[name]; !known {
+				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, loose-objects, commit-messages, notes", name)
+			}
 		}
 	}
-	return nil
+	for _, name := range s.Include {
+		if slices.Contains(s.Exclude, name) {
+			return nil, fmt.Errorf("git resource %q cannot be both included and excluded", name)
+		}
+		selected[name] = true
+	}
+	for _, name := range s.Exclude {
+		selected[name] = false
+	}
+	for _, enabled := range selected {
+		if enabled {
+			return selected, nil
+		}
+	}
+	return nil, errors.New("git resource selection leaves nothing to scan")
 }
 
 func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) error {
@@ -98,6 +132,13 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.URL != "" {
+		return scm.CloneToTempDir(ctx, s.URL, s.Token, "betterleaks-git-*", scm.CloneOptions{Mirror: true, Bare: false, SingleBranch: false, Depth: 0}, func(path string) error {
+			local := *s
+			local.RepoPath, local.URL, local.Token = path, "", ""
+			return local.Fragments(ctx, yield)
+		})
+	}
 	r, _, cleanup, err := s.open(ctx)
 	if err != nil {
 		return err
@@ -106,13 +147,37 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	// Resolve once per scan without mutating caller-owned settings; the same
 	// Source can be scanned concurrently.
 	resolved := *s
-	resolved.Platform, resolved.RemoteURL = s.resolveRemote(r)
+	resources, _ := s.resources() // Validate already checked the selection.
+	if resources[sources.GitResourceTypeHistory] || resources[sources.GitResourceTypeCommitMessages] {
+		resolved.Platform, resolved.RemoteURL = s.resolveRemote(r)
+	}
+	store := r.Storer.(*objectStorage)
+	var loose *looseObjects
+	if resources[sources.GitResourceTypeLooseObjects] {
+		loose, err = findLoose(ctx, store)
+		if err != nil {
+			return err
+		}
+	}
+	if resources[sources.GitResourceTypeHistory] || resources[sources.GitResourceTypeCommitMessages] {
+		if err := resolved.commits(ctx, r, loose, yield); err != nil {
+			return err
+		}
+	}
+	if resources[sources.GitResourceTypeNotes] {
+		if err := resolved.notes(ctx, r, loose, yield); err != nil {
+			return err
+		}
+	}
+	return resolved.looseBlobs(ctx, store, loose, yield)
+}
+
+func (s *Source) commits(ctx context.Context, r *git.Repository, loose *looseObjects, yield sources.FragmentsFunc) error {
 	history, err := s.history(ctx, r)
 	if err != nil {
 		return err
 	}
-	author, _ := regexp.Compile(s.Author)
-	committer, _ := regexp.Compile(s.Committer)
+	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
 		workers = min(max(runtime.GOMAXPROCS(0), 1), 8)
@@ -128,7 +193,8 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	jobs := make(chan *object.Commit, workers)
 	for range workers {
 		group.Go(func() error {
-			w := worker{source: &resolved, trees: trees, store: r.Storer.(*objectStorage), maxBlob: maxBlob, patches: patches}
+			var differ lineDiffer
+			w := worker{source: s, trees: trees, store: r.Storer.(*objectStorage), maxBlob: maxBlob, patches: patches, loose: loose, differ: differ}
 			for {
 				select {
 				case <-workCtx.Done():
@@ -158,10 +224,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			if e != nil {
 				return e
 			}
-			if (s.Since != nil && c.Committer.When.Before(*s.Since)) || (s.Until != nil && c.Committer.When.After(*s.Until)) {
-				continue
-			}
-			if !author.MatchString(c.Author.Name+" <"+c.Author.Email+">") || !committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">") {
+			if !accept(c) {
 				continue
 			}
 			selected++
@@ -180,6 +243,23 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	return err
 }
 
+func (s *Source) selector() func(*object.Commit) bool {
+	author, _ := regexp.Compile(s.Author)
+	committer, _ := regexp.Compile(s.Committer)
+	return func(c *object.Commit) bool {
+		return !(s.Since != nil && c.Committer.When.Before(*s.Since)) && !(s.Until != nil && c.Committer.When.After(*s.Until)) &&
+			author.MatchString(c.Author.Name+" <"+c.Author.Email+">") && committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">")
+	}
+}
+
+func commitAttributes(c *object.Commit) map[string]string {
+	return map[string]string{
+		sources.AttrGitSHA: c.Hash.String(), sources.AttrGitAuthorName: c.Author.Name, sources.AttrGitAuthorEmail: c.Author.Email,
+		sources.AttrGitDate: c.Author.When.UTC().Format(time.RFC3339), sources.AttrGitMessage: c.Message,
+		AttrCommitterName: c.Committer.Name, AttrCommitterEmail: c.Committer.Email, AttrCommitterDate: c.Committer.When.UTC().Format(time.RFC3339),
+	}
+}
+
 type worker struct {
 	source  *Source
 	trees   *treeCache
@@ -187,17 +267,14 @@ type worker struct {
 	maxBlob int64
 	differ  lineDiffer
 	patches *patchCache
+	loose   *looseObjects
 }
 
 func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.FragmentsFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	attrs := map[string]string{
-		sources.AttrGitSHA: c.Hash.String(), sources.AttrGitAuthorName: c.Author.Name, sources.AttrGitAuthorEmail: c.Author.Email,
-		sources.AttrGitDate: c.Author.When.UTC().Format(time.RFC3339), sources.AttrGitMessage: c.Message,
-		AttrCommitterName: c.Committer.Name, AttrCommitterEmail: c.Committer.Email, AttrCommitterDate: c.Committer.When.UTC().Format(time.RFC3339),
-	}
+	attrs := commitAttributes(c)
 	if w.source.RemoteURL != "" {
 		attrs[sources.AttrGitRemoteURL] = w.source.RemoteURL
 		attrs[sources.AttrGitPlatform] = w.source.Platform.String()
@@ -214,7 +291,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 			}
 		}
 	}
-	if w.source.NoMergePatches && len(c.ParentHashes) > 1 {
+	if slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) || (w.source.NoMergePatches && len(c.ParentHashes) > 1) {
 		return nil
 	}
 	changes, err := treeChanges(ctx, c, w.trees)
@@ -228,6 +305,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 		if change.To.Name == "" {
 			continue
 		}
+		w.loose.encountered(change.To.TreeEntry.Hash)
 		fileAttrs := maps.Clone(attrs)
 		fileAttrs[sources.AttrPath] = change.To.Name
 		fileAttrs[sources.AttrResource] = sources.ResourceGitPatchContent

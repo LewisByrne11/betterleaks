@@ -1,110 +1,15 @@
 package scm
 
 import (
-	"encoding/base64"
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
-
-func TestAuthCloneConfigs(t *testing.T) {
-	tests := []struct {
-		name    string
-		remote  string
-		token   string
-		want    []GitConfig
-		wantErr bool
-	}{
-		{
-			name:   "https with token",
-			remote: "https://github.com/owner/repo.git",
-			token:  "ghp_abcdef",
-			want: []GitConfig{{
-				Key:   "http.https://github.com.extraHeader",
-				Value: "Authorization: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghp_abcdef")),
-			}},
-		},
-		{
-			name:   "http with token",
-			remote: "http://example.com/repo.git",
-			token:  "tkn",
-			want: []GitConfig{{
-				Key:   "http.http://example.com.extraHeader",
-				Value: "Authorization: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:tkn")),
-			}},
-		},
-		{
-			name:   "no token returns remote unchanged",
-			remote: "https://github.com/owner/repo.git",
-			token:  "",
-			want:   nil,
-		},
-		{
-			name:   "ssh remote returned unchanged",
-			remote: "git@github.com:owner/repo.git",
-			token:  "ghp_abcdef",
-			want:   nil,
-		},
-		{
-			name:   "enterprise host",
-			remote: "https://github.enterprise.com/owner/repo.git",
-			token:  "tkn",
-			want: []GitConfig{{
-				Key:   "http.https://github.enterprise.com.extraHeader",
-				Value: "Authorization: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:tkn")),
-			}},
-		},
-		{
-			name:    "malformed URL",
-			remote:  "://bad",
-			token:   "tkn",
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := authCloneConfigs(tc.remote, tc.token)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("authCloneConfigs() len = %d, want %d", len(got), len(tc.want))
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Errorf("authCloneConfigs()[%d] = %#v, want %#v", i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
-
-func TestGitCloneEnv(t *testing.T) {
-	t.Setenv("GIT_CONFIG_GLOBAL", "NUL")
-	t.Setenv("GIT_CONFIG_SYSTEM", "NUL")
-	env := gitCloneEnv([]GitConfig{{Key: "http.extraheader", Value: "Authorization: basic abc"}})
-	joined := strings.Join(env, "\n")
-
-	for _, want := range []string{
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http.extraheader",
-		"GIT_CONFIG_VALUE_0=Authorization: basic abc",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("gitCloneEnv() missing %q in %q", want, joined)
-		}
-	}
-}
 
 func TestSanitizeOutput(t *testing.T) {
 	tests := []struct {
@@ -158,5 +63,46 @@ func TestSanitizeOutput(t *testing.T) {
 				t.Errorf("SanitizeOutput() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCloneTransportBoundary(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("unexpected credentials on anonymous request")
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	var opts CloneOptions
+	for _, remote := range []string{"ssh://git@example.test/repo", "file:///tmp/repo", "git@example.test:repo", server.URL + "/repo?token=secret", server.URL + "/repo?", "http://user:secret@" + strings.TrimPrefix(server.URL, "http://") + "/repo"} {
+		err := CloneAuthed(t.Context(), remote, "", filepath.Join(t.TempDir(), "repo"), opts)
+		if err == nil || !strings.Contains(err.Error(), "HTTP(S) URL") {
+			t.Fatalf("unexpected URL validation result for %q: %v", remote, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("URL credentials leaked: %v", err)
+		}
+	}
+	if err := CloneAuthed(t.Context(), server.URL+"/repo", "secret", filepath.Join(t.TempDir(), "repo"), opts); err == nil || !strings.Contains(err.Error(), "require HTTPS") {
+		t.Fatalf("expected insecure token rejection, got %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatal("rejected clone made a network request")
+	}
+	if err := CloneAuthed(t.Context(), server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo"), opts); err == nil {
+		t.Fatal("expected missing repository error")
+	}
+	if requests.Load() == 0 {
+		t.Fatal("clone did not use HTTP with an empty PATH")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := CloneAuthed(ctx, server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo"), opts)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation, got %v", err)
 	}
 }

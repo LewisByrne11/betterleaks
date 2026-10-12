@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -55,6 +56,11 @@ func (s *Source) history(ctx context.Context, r *git.Repository) (*history, erro
 		}
 		id, err := r.ResolveRevision(plumbing.Revision(revision))
 		if err != nil {
+			// An unborn default HEAD has no history, but may have staged loose
+			// blobs or notes. Explicit missing revisions remain errors.
+			if s.Revision == "" && errors.Is(err, plumbing.ErrReferenceNotFound) {
+				return h, nil
+			}
 			return nil, fmt.Errorf("resolve revision %q: %w", revision, err)
 		}
 		if err = h.tip(ctx, *id); err != nil {
@@ -86,12 +92,18 @@ func (s *Source) history(ctx context.Context, r *git.Repository) (*history, erro
 		if err != nil {
 			return nil, err
 		}
+		if strings.HasPrefix(ref.Name().String(), "refs/notes/") {
+			continue
+		}
 		// IterReferences can include symbolic remote HEADs. Resolve them rather than
 		// interpreting their zero hash as an object ID.
 		if ref.Type() == plumbing.SymbolicReference {
 			name := ref.Name()
 			ref, err = storer.ResolveReference(r.Storer, name)
 			if err != nil {
+				if name == plumbing.HEAD && errors.Is(err, plumbing.ErrReferenceNotFound) {
+					continue // Unborn HEAD; there may still be notes or loose blobs.
+				}
 				return nil, fmt.Errorf("resolve ref %s: %w", name, err)
 			}
 		}

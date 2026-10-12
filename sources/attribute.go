@@ -11,12 +11,18 @@ const (
 	AttrResource = "resource"
 
 	// Resource values — what kind of thing the fragment is.
-	ResourceFileContent      = "fs.content"
-	ResourceURLContent       = "url.content"
-	ResourceGitPatchContent  = "git.patch_content"
-	ResourceGitCommitMessage = "git.commit_message"
-	ResourceGitTagMessage    = "git.tag_message"
-	ResourceGitReflogMessage = "git.reflog_message"
+	ResourceFileContent           = "fs.content"
+	ResourceURLContent            = "url.content"
+	ResourceGitNote               = "git.note"
+	ResourceGitLooseBlob          = "git.loose_blob"
+	GitResourceTypeCommitMessages = "commit-messages"
+	GitResourceTypeNotes          = "notes"
+	GitResourceTypeHistory        = "history"
+	GitResourceTypeLooseObjects   = "loose-objects"
+	ResourceGitPatchContent       = "git.patch_content"
+	ResourceGitCommitMessage      = "git.commit_message"
+	ResourceGitTagMessage         = "git.tag_message"
+	ResourceGitReflogMessage      = "git.reflog_message"
 
 	// Git
 	AttrGitSHA              = "git.sha"

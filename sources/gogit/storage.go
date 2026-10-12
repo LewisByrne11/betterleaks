@@ -130,6 +130,26 @@ func (f readOnlyFS) Open(path string) (billy.File, error) {
 	}
 	return f.Filesystem.Open(path)
 }
+
+// Git ignores dotfiles in ref directories (for example fixture .gitkeep files).
+func (f readOnlyFS) ReadDir(path string) ([]os.DirEntry, error) {
+	entries, err := f.Filesystem.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if clean == "refs" || strings.HasPrefix(clean, "refs/") {
+		visible := entries[:0]
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".") {
+				visible = append(visible, entry)
+			}
+		}
+		return visible, nil
+	}
+	return entries, nil
+}
+
 func (f readOnlyFS) OpenFile(path string, flag int, perm os.FileMode) (billy.File, error) {
 	if flag != os.O_RDONLY {
 		return nil, os.ErrPermission
