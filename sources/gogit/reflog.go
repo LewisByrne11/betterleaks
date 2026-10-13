@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +21,11 @@ import (
 // reverse index or sorting by timestamps. History deduplicates their tips with
 // ordinary ref history. Old IDs matter: a reset can discard its old tip.
 func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *history, messages bool, yield sources.FragmentsFunc) error {
+	cfg, err := store.Config()
+	if err != nil {
+		return err
+	}
+	hashLength := plumbing.FromObjectFormat(cfg.Extensions.ObjectFormat).Size() * 2
 	fs := store.Filesystem().(readOnlyFS)
 	root, err := os.OpenRoot(fs.objectRoot)
 	if err != nil {
@@ -49,7 +53,7 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *histor
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			e, err := parseReflog(scanner.Text())
+			e, err := parseReflog(scanner.Text(), hashLength)
 			if err != nil {
 				return fmt.Errorf("reflog %s line %d: %w", name, line, err)
 			}
@@ -196,7 +200,7 @@ type reflogEntry struct {
 	when                 time.Time
 }
 
-func parseReflog(line string) (reflogEntry, error) {
+func parseReflog(line string, hashLength int) (reflogEntry, error) {
 	var e reflogEntry
 	bad := errors.New("malformed reflog entry") // Never echo secret-bearing input.
 	header, message, _ := strings.Cut(line, "\t")
@@ -206,10 +210,7 @@ func parseReflog(line string) (reflogEntry, error) {
 		return e, bad
 	}
 	for _, id := range fields[:2] {
-		if len(id) != 40 {
-			return e, bad
-		}
-		if _, err := hex.DecodeString(id); err != nil {
+		if len(id) != hashLength || !plumbing.IsHash(id) {
 			return e, bad
 		}
 	}

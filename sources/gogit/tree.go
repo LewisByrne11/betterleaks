@@ -123,9 +123,25 @@ func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (ob
 		return nil, err
 	}
 	var changes object.Changes
+	// A small tree DAG can expand into exponentially many paths. Bound each
+	// comparison (workers release it before taking another commit), including
+	// empty directories and path bytes, not just the number of unique objects.
+	const maxEntries, maxChanges, maxPathBytes = 1_000_000, 100_000, 16 << 20
+	entries, pathBytes := 0, 0
+	charge := func(nameBytes int) error {
+		entries++
+		pathBytes += nameBytes
+		if entries > maxEntries || len(changes) >= maxChanges || pathBytes > maxPathBytes {
+			return fmt.Errorf("git tree comparison exceeds expansion budget (%d entries, %d changes, %d path bytes)", maxEntries, maxChanges, maxPathBytes)
+		}
+		return ctx.Err()
+	}
 	var walk func(*object.Tree, *object.Tree, string) error
 	var expand func(*object.Tree, object.TreeEntry, string, bool) error
 	expand = func(tree *object.Tree, entry object.TreeEntry, prefix string, added bool) error {
+		if err := charge(len(prefix) + len(entry.Name)); err != nil {
+			return err
+		}
 		name := prefix + entry.Name
 		if entry.Mode == filemode.Dir {
 			sub, err := cache.get(entry.Hash)
@@ -185,6 +201,9 @@ func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (ob
 			}
 			left, right := a[i], b[j]
 			if left.Name == right.Name {
+				if err := charge(2 * (len(prefix) + len(left.Name))); err != nil {
+					return err
+				}
 				i++
 				j++
 				if left.Mode == right.Mode && left.Hash == right.Hash {

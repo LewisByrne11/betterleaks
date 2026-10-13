@@ -88,6 +88,9 @@ func readGitPatch(ctx context.Context, input io.Reader, header func(*gitdiff.Fil
 				return nil
 			}
 		}
+		if strings.HasPrefix(line, "\x1b[") {
+			return errors.New("colored Git patches are unsupported; pass --no-color to the Git producer")
+		}
 		switch {
 		case strings.HasPrefix(line, "diff --cc "), strings.HasPrefix(line, "diff --combined "):
 			return errors.New("unsupported Git combined diff; use --diff-merges=first-parent or --diff-merges=separate")

@@ -16,7 +16,7 @@ if betterleaksEnabled():
     try:
         # The hook owns the Git producer; the Betterleaks CLI/library only reads stdin.
         with subprocess.Popen(
-            ["git", "diff", "--cached", "--no-ext-diff", "--no-textconv"],
+            ["git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color"],
             stdout=subprocess.PIPE,
         ) as producer:
             try:

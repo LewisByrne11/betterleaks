@@ -106,3 +106,61 @@ func TestCloneTransportBoundary(t *testing.T) {
 		t.Fatalf("expected cancellation, got %v", err)
 	}
 }
+
+func TestCloneRedirectCredentials(t *testing.T) {
+	// Exercise CloneAuthed, including go-git's transport, rather than testing
+	// an isolated redirect callback. All servers use httptest's TLS certificate.
+	for _, mode := range []string{"downgrade", "other-origin", "same-origin"} {
+		t.Run(mode, func(t *testing.T) {
+			var targetRequests, authenticated atomic.Int32
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetRequests.Add(1)
+				if r.Header.Get("Authorization") != "" {
+					t.Error("credentials reached another origin")
+				}
+				http.NotFound(w, r)
+			})
+			var target *httptest.Server
+			if mode == "downgrade" {
+				target = httptest.NewServer(handler)
+			} else {
+				target = httptest.NewTLSServer(handler)
+			}
+			defer target.Close()
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				user, token, ok := r.BasicAuth()
+				if !ok || user != "x-access-token" || token != "TEST_TOKEN" {
+					t.Error("missing credentials at repository origin")
+				}
+				authenticated.Add(1)
+				if strings.HasPrefix(r.URL.Path, "/redirected/") {
+					http.NotFound(w, r)
+					return
+				}
+				location := target.URL + "/redirected/info/refs?service=git-upload-pack"
+				if mode == "same-origin" {
+					location = "/redirected/info/refs?service=git-upload-pack"
+				}
+				http.Redirect(w, r, location, http.StatusFound)
+			}))
+			defer origin.Close()
+			previous := http.DefaultTransport
+			http.DefaultTransport = origin.Client().Transport
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			var opts CloneOptions
+			err := CloneAuthed(t.Context(), origin.URL+"/repo", "TEST_TOKEN", filepath.Join(t.TempDir(), "repo"), opts)
+			if err == nil || strings.Contains(err.Error(), "TEST_TOKEN") {
+				t.Fatalf("expected sanitized clone failure: %v", err)
+			}
+			if mode == "downgrade" && targetRequests.Load() != 0 {
+				t.Fatal("HTTPS downgrade was followed")
+			}
+			if mode == "other-origin" && targetRequests.Load() == 0 {
+				t.Fatal("cross-origin redirect was not exercised")
+			}
+			if mode == "same-origin" && authenticated.Load() < 2 {
+				t.Fatal("same-origin redirect was not exercised")
+			}
+		})
+	}
+}

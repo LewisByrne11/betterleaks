@@ -77,7 +77,7 @@ Use this command in pre-commit hooks:
 
 ```sh
 set -o pipefail
-git diff --cached --no-ext-diff --no-textconv | betterleaks stdin --git-diff --redact
+git diff --cached --no-ext-diff --no-textconv --no-color | betterleaks stdin --git-diff --redact
 ```
 
 ### Commands and flags

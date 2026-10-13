@@ -700,7 +700,11 @@ appear as ordinary patches in this broad history traversal.
 
 Tag and reflog messages are independent of commit date/identity/count filters
 and `--revision`; source attribute filters can select them. Neither message-only
-pass compares file trees. Reflog records are streamed with a 1 MiB per-record
+pass compares file trees. Annotated tag messages are scanned per referring tag
+ref, including nested annotations. Shared tag objects can therefore produce
+multiple findings with distinct `git.tag_source_ref` attributes; this preserves
+ref-specific filtering and attribution.
+Reflog records are streamed with a 1 MiB per-record
 limit and a 64-level directory-depth limit; unsupported links, malformed or
 truncated records, and missing history objects report incomplete coverage.
 Missing journals are normal. Reflogs expire, may be disabled, and are not fetched
@@ -732,8 +736,14 @@ Keep configuration immutable while scanning.
 Worker queues and caches are bounded. `--git-workers` defaults to at most eight
 (maximum 16); `--jobs` independently controls detection. Memory/disk cache flags
 remain available, and `--git-max-blob-mib` bounds diff inputs. These settings are
-not a total process memory limit. Shallow repositories, SHA-256 repositories,
-and relative alternates currently produce explicit unsupported errors.
+not a total process memory limit. SHA-1 and SHA-256 repositories are supported.
+Shallow repositories and relative alternates currently produce explicit
+unsupported errors. A file's edit search has a one-second computation budget;
+exceeding it reports an incomplete scan rather than using an approximate patch.
+Cancellation during the edit search is checked when the bounded call returns.
+Each tree comparison permits at most 1,000,000 visited entries, 100,000 changes,
+and 16 MiB of expanded path bytes. Exceeding these limits reports incomplete
+coverage, including for small tree DAGs that expand into very many paths.
 
 Supported fetch remotes generate SCM URLs from local configuration. Use
 `--platform=github` or `--platform=gitlab` for self-hosted services, or
@@ -751,17 +761,18 @@ patches. Betterleaks parses the stream and runs no producer process itself:
 ```sh
 # Any Git log selection supported by your installed Git
 set -o pipefail
-git log -p --no-ext-diff --no-textconv --all --since='90 days ago' |
+git log -p --no-ext-diff --no-textconv --no-color --all --since='90 days ago' |
   betterleaks stdin --git-diff
 
 # Staged additions, including an initial commit
-git diff --cached --no-ext-diff --no-textconv |
+git diff --cached --no-ext-diff --no-textconv --no-color |
   betterleaks stdin --git-diff --redact
 
 # Unstaged additions to tracked files
-git diff --no-ext-diff --no-textconv | betterleaks stdin --git-diff
+git diff --no-ext-diff --no-textconv --no-color | betterleaks stdin --git-diff
 ```
 
+Use `--no-color` even when piping: Git configuration can force colored output.
 The explicit helper-disabling options prevent the producer from invoking
 repository-selected diff helpers. Use pipeline failure propagation in automation
 so a failed Git producer cannot look like an empty successful scan. The scanner
@@ -775,9 +786,8 @@ Combined merge patches are rejected; request `--diff-merges=first-parent` or
 `--diff-merges=separate` from the producer. Empty input is valid. SDK callers can
 use `sources.GitDiff{Content: reader}` with the same prefilter and yield contract.
 
-Annotated-tag and reflog message resources are not currently supported by the
-object source; requesting them fails explicitly. For pre-receive hooks, the
-caller must select the pushed revision ranges and pipe ordinary patches to
+For pre-receive hooks, the caller must select the pushed revision ranges and
+pipe ordinary patches to
 `stdin --git-diff`. Git's quarantine object environment is not handled by the
 object source.
 

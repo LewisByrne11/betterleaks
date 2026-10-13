@@ -195,3 +195,14 @@ func TestGitDiffContextCoordinatesAndMetadata(t *testing.T) {
 	source.Prefilter = func(a map[string]string) bool { return a[AttrPath] == "a.txt" }
 	require.NoError(t, source.Fragments(t.Context(), func(Fragment, error) error { t.Fatal("filtered patch yielded"); return nil }))
 }
+
+//nolint:exhaustruct // Fixtures specify only relevant fields.
+func TestGitDiffRejectsColoredHeaders(t *testing.T) {
+	patch := "\x1b[1mdiff --git a/secret b/secret\x1b[m\n\x1b[32m+SECRET\x1b[m\n"
+	s := GitDiff{Content: strings.NewReader(patch)}
+	err := s.Fragments(t.Context(), func(Fragment, error) error {
+		t.Fatal("colored input yielded a fragment")
+		return nil
+	})
+	require.ErrorContains(t, err, "--no-color")
+}

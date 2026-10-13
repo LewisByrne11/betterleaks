@@ -184,6 +184,7 @@ func TestPreCommitHookCommands(t *testing.T) {
 		require.NoError(t, err, "%s", out)
 	}
 	git("init", "--quiet")
+	git("config", "color.ui", "always")
 	configPath := filepath.Join(t.TempDir(), "rules.toml")
 	require.NoError(t, os.WriteFile(configPath, []byte("[[rules]]\nid='hook-secret'\nregex='SECRET_PRIVATE'\n"), 0o600))
 
@@ -195,7 +196,7 @@ func TestPreCommitHookCommands(t *testing.T) {
 				t.Skip("pinned released Docker image uses the legacy CLI; not the working tree binary")
 			}
 			require.Contains(t, entry, "bash -o pipefail")
-			require.Contains(t, entry, "git diff --cached --no-ext-diff --no-textconv")
+			require.Contains(t, entry, "git diff --cached --no-ext-diff --no-textconv --no-color")
 			_, scannerArgs, ok := strings.Cut(entry, "| betterleaks ")
 			require.True(t, ok)
 			// A CRLF checkout leaves a carriage return after the shell quote.
@@ -217,7 +218,7 @@ func TestPreCommitHookCommands(t *testing.T) {
 							root, output := newTestCLI(t)
 							code := 0
 							root.runtime.exit = func(n int) { code = n; panic(n) }
-							patch, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-textconv").Output()
+							patch, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color").Output()
 							require.NoError(t, err)
 							root.SetIn(bytes.NewReader(patch))
 							root.SetArgs(append(append([]string{}, args...), "--no-banner", "--config", configPath))

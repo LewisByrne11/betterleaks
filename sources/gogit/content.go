@@ -124,11 +124,6 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 	if strings.HasPrefix(dst, src) && (src == "" || src[len(src)-1] == '\n') {
 		return emit(strings.Clone(dst[len(src):]), strings.Count(src, "\n")+1)
 	}
-	dmp := diffmatchpatch.New()
-	dmp.DiffTimeout = time.Hour
-	if deadline, ok := ctx.Deadline(); ok {
-		dmp.DiffTimeout = min(dmp.DiffTimeout, max(time.Until(deadline), time.Nanosecond))
-	}
 	// Only parent lines can be matches. Tokenize them once; destination-only
 	// lines need neither IDs nor strings in the dictionary. Use valid Unicode
 	// tokens because the edit engine serializes rune sequences as strings.
@@ -229,8 +224,24 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 	for i := range added {
 		added[i] = true
 	}
+	// The edit engine has no context hook. Bound its synchronous search rather
+	// than leaving a background goroutine running after cancellation. Reject
+	// timeout approximations: they must not silently change patch coverage.
+	dmp := diffmatchpatch.New()
+	dmp.DiffTimeout = time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		dmp.DiffTimeout = min(dmp.DiffTimeout, max(time.Until(deadline), time.Nanosecond))
+	}
+	started := time.Now()
+	chunks := dmp.DiffMainRunes(old, current, false)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if time.Since(started) >= dmp.DiffTimeout {
+		return errors.New("git diff exceeded its one-second computation budget")
+	}
 	at := 0
-	for _, chunk := range dmp.DiffMainRunes(old, current, false) {
+	for _, chunk := range chunks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

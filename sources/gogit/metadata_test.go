@@ -157,11 +157,16 @@ func TestReflogErrorsAndCancellation(t *testing.T) {
 
 func FuzzParseReflog(f *testing.F) {
 	f.Add(strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " Test <test@example.test> 1700000000 +0000\tmessage")
+	f.Add(strings.Repeat("0", 64) + " " + strings.Repeat("1", 64) + " Test <test@example.test> 1700000000 +0000\tmessage")
 	f.Add("")
 	f.Fuzz(func(t *testing.T, raw string) {
-		e, err := parseReflog(raw)
-		if err == nil {
-			require.True(t, e.when.Year() >= 0 && e.when.Year() <= 9999)
+		for _, length := range []int{40, 64} {
+			e, err := parseReflog(raw, length)
+			if err == nil {
+				require.True(t, e.when.Year() >= 0 && e.when.Year() <= 9999)
+				require.Len(t, e.old.String(), length)
+				require.Len(t, e.new.String(), length)
+			}
 		}
 	})
 }
@@ -413,5 +418,31 @@ func TestMessageAndPatchScopes(t *testing.T) {
 			require.Zero(t, messages[abandoned])
 			require.Zero(t, patches[abandoned])
 		}
+	}
+}
+
+// A tag object can have several independently filterable ref occurrences.
+// Deduplicating by object ID before filtering would hide allowed aliases.
+//
+//nolint:exhaustruct // Fixtures specify only relevant fields.
+func TestTagMessageAliasesPreserveRefFilters(t *testing.T) {
+	repo := newHistory(t)
+	gitFixture(t, repo, "tag", "-a", "first", "-m", "SHARED_SECRET")
+	id := gitFixture(t, repo, "rev-parse", "first")
+	gitFixture(t, repo, "update-ref", "refs/tags/second", id)
+	s := &Source{RepoPath: repo, Include: []string{"tag-messages"}, Exclude: []string{"history"}}
+	fragments := collect(t, s)
+	require.Len(t, fragments, 2)
+	refs := make(map[string]bool)
+	for _, f := range fragments {
+		require.Equal(t, id, f.Attr("git.tag_sha"))
+		refs[f.Attr(sources.AttrGitTagRef)] = true
+	}
+	require.Equal(t, map[string]bool{"refs/tags/first": true, "refs/tags/second": true}, refs)
+	for ref := range refs {
+		s.Prefilter = func(attrs map[string]string) bool { return attrs[sources.AttrGitTagRef] != ref }
+		fragments = collect(t, s)
+		require.Len(t, fragments, 1)
+		require.Equal(t, ref, fragments[0].Attr(sources.AttrGitTagRef))
 	}
 }

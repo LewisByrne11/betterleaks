@@ -18,10 +18,14 @@ import (
 	"time"
 
 	"github.com/betterleaks/betterleaks/v2/sources"
+	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/stretchr/testify/require"
 )
 
@@ -280,6 +284,24 @@ func TestSHA256(t *testing.T) {
 	require.Len(t, fs, 1)
 	require.Len(t, fs[0].Attr(AttrBlobSHA), 64)
 	require.Len(t, fs[0].Attr(sources.AttrGitSHA), 64)
+	root := gitFixture(t, repo, "rev-parse", "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "secret"), []byte("ABANDONED_SHA256\n"), 0644))
+	gitFixture(t, repo, "add", ".")
+	gitFixture(t, repo, "commit", "-qm", "abandoned")
+	gitFixture(t, repo, "reset", "--hard", root)
+	t.Setenv("PATH", t.TempDir())
+	fs = collect(t, &Source{RepoPath: repo, Include: []string{"reflog-history", "reflog-messages"}})
+	var abandoned, messages bool
+	for _, f := range fs {
+		abandoned = abandoned || f.Raw == "ABANDONED_SHA256\n"
+		if f.Attr(sources.AttrResource) == sources.ResourceGitReflogMessage {
+			messages = true
+			require.Len(t, f.Attr("git.reflog_old_sha"), 64)
+			require.Len(t, f.Attr("git.reflog_new_sha"), 64)
+		}
+	}
+	require.True(t, abandoned)
+	require.True(t, messages)
 }
 
 // Test the edit script rather than mirroring the diff implementation: emitted
@@ -859,4 +881,69 @@ func TestObjectScanCancellationAndLinks(t *testing.T) {
 	require.NoError(t, os.Remove(dir))
 	require.NoError(t, os.Symlink(filepath.Dir(outside), dir))
 	require.ErrorContains(t, s.Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from linked object directory"); return nil }), "not a directory")
+}
+
+// A tiny DAG represents more than 100,000 file paths, or over a million empty
+// directories. Neither may be expanded without a bound merely because its
+// unique objects fit in the cache.
+//
+//nolint:exhaustruct // Fixtures specify only relevant fields.
+func TestTreeExpansionBudget(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty=%v", empty), func(t *testing.T) {
+			store := memory.NewStorage()
+			repo, err := git.Init(store, nil)
+			require.NoError(t, err)
+			var tree object.Tree
+			if !empty {
+				blob := store.NewEncodedObject()
+				blob.SetType(plumbing.BlobObject)
+				id, err := store.SetEncodedObject(blob)
+				require.NoError(t, err)
+				tree.Entries = []object.TreeEntry{{Name: "secret", Mode: filemode.Regular, Hash: id}}
+			}
+			var id plumbing.Hash
+			for range 21 {
+				encoded := store.NewEncodedObject()
+				require.NoError(t, tree.Encode(encoded))
+				id, err = store.SetEncodedObject(encoded)
+				require.NoError(t, err)
+				tree.Entries = []object.TreeEntry{{Name: "a", Mode: filemode.Dir, Hash: id}, {Name: "b", Mode: filemode.Dir, Hash: id}}
+			}
+			changes, err := rawTreeChanges(t.Context(), &object.Commit{TreeHash: id}, &treeCache{r: repo})
+			require.ErrorContains(t, err, "expansion budget")
+			require.Empty(t, changes, "an incomplete comparison must not yield partial patches")
+		})
+	}
+}
+
+func TestExpensiveDiffBudget(t *testing.T) {
+	var src, dst strings.Builder
+	// Every line exists in both versions, defeating unmatched-line pruning.
+	// Reverse order also avoids the diff engine's half-match shortcut.
+	for i := range 30000 {
+		fmt.Fprintf(&src, "line %d\n", i)
+		fmt.Fprintf(&dst, "line %d\n", 29999-i)
+	}
+	for _, cancelDuringSearch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%v", cancelDuringSearch), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if cancelDuringSearch {
+				timer := time.AfterFunc(50*time.Millisecond, cancel)
+				defer timer.Stop()
+			}
+			started := time.Now()
+			err := lineAdditions(ctx, src.String(), dst.String(), func(string, int) error {
+				t.Error("timed-out diff yielded approximate additions")
+				return nil
+			})
+			if cancelDuringSearch {
+				require.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.ErrorContains(t, err, "computation budget")
+			}
+			require.Less(t, time.Since(started), 5*time.Second)
+		})
+	}
 }
