@@ -198,42 +198,49 @@ func TestPreCommitHookCommands(t *testing.T) {
 			require.Contains(t, entry, "git diff --cached --no-ext-diff --no-textconv")
 			_, scannerArgs, ok := strings.Cut(entry, "| betterleaks ")
 			require.True(t, ok)
-			args := strings.Fields(strings.TrimSuffix(scannerArgs, "'"))
-			require.NotContains(t, args, "--validate")
-			require.NotContains(t, args, "--analyze")
-			for _, secret := range []bool{false, true} {
-				t.Run(fmt.Sprintf("secret=%t", secret), func(t *testing.T) {
-					content := "ordinary content\n"
-					if secret {
-						content = "SECRET_PRIVATE\n"
-					}
-					require.NoError(t, os.WriteFile("input.txt", []byte(content), 0o600))
-					git("add", "input.txt")
-					root, output := newTestCLI(t)
-					code := 0
-					root.runtime.exit = func(n int) { code = n; panic(n) }
-					patch, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-textconv").Output()
-					require.NoError(t, err)
-					root.SetIn(bytes.NewReader(patch))
-					root.SetArgs(append(append([]string{}, args...), "--no-banner", "--config", configPath))
-					func() {
-						defer func() {
-							if p := recover(); p != nil {
-								if _, ok := p.(int); !ok {
-									panic(p)
-								}
+			// A CRLF checkout leaves a carriage return after the shell quote.
+			scannerArgs = strings.TrimSuffix(scannerArgs, "\r")
+			for name, ending := range map[string]string{"LF": "", "CRLF": "\r"} {
+				t.Run(name, func(t *testing.T) {
+					args := strings.Fields(strings.TrimSuffix(strings.TrimSpace(scannerArgs+ending), "'"))
+					require.Equal(t, []string{"stdin", "--git-diff", "--redact"}, args)
+					require.NotContains(t, args, "--validate")
+					require.NotContains(t, args, "--analyze")
+					for _, secret := range []bool{false, true} {
+						t.Run(fmt.Sprintf("secret=%t", secret), func(t *testing.T) {
+							content := "ordinary content\n"
+							if secret {
+								content = "SECRET_PRIVATE\n"
 							}
-						}()
-						require.NoError(t, root.Execute())
-					}()
-					if secret {
-						require.Equal(t, 1, code)
-						require.Contains(t, output.String(), "REDACTED")
-					} else {
-						require.Zero(t, code)
-						require.Empty(t, output.String())
+							require.NoError(t, os.WriteFile("input.txt", []byte(content), 0o600))
+							git("add", "input.txt")
+							root, output := newTestCLI(t)
+							code := 0
+							root.runtime.exit = func(n int) { code = n; panic(n) }
+							patch, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-textconv").Output()
+							require.NoError(t, err)
+							root.SetIn(bytes.NewReader(patch))
+							root.SetArgs(append(append([]string{}, args...), "--no-banner", "--config", configPath))
+							func() {
+								defer func() {
+									if p := recover(); p != nil {
+										if _, ok := p.(int); !ok {
+											panic(p)
+										}
+									}
+								}()
+								require.NoError(t, root.Execute())
+							}()
+							if secret {
+								require.Equal(t, 1, code)
+								require.Contains(t, output.String(), "REDACTED")
+							} else {
+								require.Zero(t, code)
+								require.Empty(t, output.String())
+							}
+							require.NotContains(t, output.String(), "SECRET_PRIVATE")
+						})
 					}
-					require.NotContains(t, output.String(), "SECRET_PRIVATE")
 				})
 			}
 		})
