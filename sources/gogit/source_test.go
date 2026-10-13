@@ -104,7 +104,7 @@ func TestSource(t *testing.T) {
 		t.Run(fmt.Sprintf("packed=%v", packed), func(t *testing.T) {
 			t.Setenv("PATH", t.TempDir())
 			for _, workers := range []int{1, 4} {
-				fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Workers: workers})
+				fs := collect(t, &Source{RepoPath: repo, Workers: workers})
 				require.Equal(t, expected, textOccurrences(fs))
 				for _, f := range fs {
 					require.Len(t, f.Attr(sources.AttrGitSHA), 40)
@@ -122,12 +122,12 @@ func TestSource(t *testing.T) {
 	t.Run("alternates", func(t *testing.T) {
 		shared := filepath.Join(t.TempDir(), "shared")
 		gitFixture(t, repo, "clone", "-q", "--shared", repo, shared)
-		require.Equal(t, expected, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: shared})))
+		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: shared})))
 	})
 	t.Run("shallow", func(t *testing.T) {
 		shallow := filepath.Join(t.TempDir(), "shallow")
 		gitFixture(t, repo, "clone", "-q", "--depth=1", "file://"+repo, shallow)
-		err := (&Source{Exclude: []string{"loose-objects"}, RepoPath: shallow}).Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from unsupported shallow history"); return nil })
+		err := (&Source{RepoPath: shallow}).Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from unsupported shallow history"); return nil })
 		require.ErrorContains(t, err, "shallow")
 	})
 	t.Run("cancel-slow-consumer", func(t *testing.T) {
@@ -136,7 +136,7 @@ func TestSource(t *testing.T) {
 		entered := make(chan struct{}, 1)
 		done := make(chan error, 1)
 		go func() {
-			done <- (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Workers: 4}).Fragments(ctx, func(sources.Fragment, error) error {
+			done <- (&Source{RepoPath: repo, Workers: 4}).Fragments(ctx, func(sources.Fragment, error) error {
 				select {
 				case entered <- struct{}{}:
 				default:
@@ -159,17 +159,17 @@ func TestSource(t *testing.T) {
 		}
 	})
 	t.Run("prefilter", func(t *testing.T) {
-		fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Prefilter: func(a map[string]string) bool { return a[sources.AttrPath] != "side.txt" }})
+		fs := collect(t, &Source{RepoPath: repo, Prefilter: func(a map[string]string) bool { return a[sources.AttrPath] != "side.txt" }})
 		require.Equal(t, map[string]string{"TOKEN_SIDE\n": "side.txt:1"}, textOccurrences(fs))
 		// Rejected resources must not require content materialization.
-		require.Empty(t, collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, MaxBlobBytes: 1, Prefilter: func(map[string]string) bool { return true }}))
+		require.Empty(t, collect(t, &Source{RepoPath: repo, MaxBlobBytes: 1, Prefilter: func(map[string]string) bool { return true }}))
 	})
 	t.Run("author", func(t *testing.T) {
-		fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Author: "modify <"})
+		fs := collect(t, &Source{RepoPath: repo, Author: "modify <"})
 		require.Equal(t, map[string]string{"TOKEN_CHANGED\n": "file.txt:2"}, textOccurrences(fs))
 	})
 	t.Run("messages", func(t *testing.T) {
-		fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Include: []string{"commit-messages"}})
+		fs := collect(t, &Source{RepoPath: repo, Include: []string{"commit-messages"}})
 		messages := 0
 		for _, f := range fs {
 			if f.Attr(sources.AttrResource) == sources.ResourceGitCommitMessage {
@@ -181,27 +181,27 @@ func TestSource(t *testing.T) {
 	})
 	t.Run("stop", func(t *testing.T) {
 		stop := errors.New("consumer stopped")
-		err := (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Workers: 4}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
+		err := (&Source{RepoPath: repo, Workers: 4}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
 		require.ErrorIs(t, err, stop)
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		require.ErrorIs(t, (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo}).Fragments(ctx, func(sources.Fragment, error) error { t.Fatal("yield after cancellation"); return nil }), context.Canceled)
+		require.ErrorIs(t, (&Source{RepoPath: repo}).Fragments(ctx, func(sources.Fragment, error) error { t.Fatal("yield after cancellation"); return nil }), context.Canceled)
 	})
 	t.Run("limits", func(t *testing.T) {
-		err := (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, MaxBlobBytes: 1}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+		err := (&Source{RepoPath: repo, MaxBlobBytes: 1}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 		require.ErrorContains(t, err, "diff input limit")
-		require.Error(t, (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Author: "["}).Validate())
-		require.Error(t, (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Include: []string{"reflogs"}}).Validate())
+		require.Error(t, (&Source{RepoPath: repo, Author: "["}).Validate())
+		require.Error(t, (&Source{RepoPath: repo, Include: []string{"reflogs"}}).Validate())
 	})
 	t.Run("bare-and-worktree", func(t *testing.T) {
 		bare := filepath.Join(t.TempDir(), "bare")
 		gitFixture(t, repo, "clone", "-q", "--bare", repo, bare)
-		require.Equal(t, expected, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: bare})))
+		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: bare})))
 		linked := filepath.Join(t.TempDir(), "linked")
 		gitFixture(t, repo, "worktree", "add", "--detach", linked, "HEAD")
 		// The fixture's hook executed during Git's checkout, not during the scan.
 		os.Remove(filepath.Join(repo, "executed"))
-		require.Equal(t, expected, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: linked})))
+		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: linked})))
 		_, err := os.Stat(filepath.Join(repo, "executed"))
 		require.ErrorIs(t, err, os.ErrNotExist)
 	})
@@ -222,7 +222,7 @@ func TestHistoricalPathNames(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte(strings.Repeat("common line\n", 100)+"TOKEN_AFTER\n"), 0600))
 	gitFixture(t, repo, "add", "--", name)
 	gitFixture(t, repo, "commit", "-qm", "historical rename")
-	fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, MaxCount: 1})
+	fs := collect(t, &Source{RepoPath: repo, MaxCount: 1})
 	require.Len(t, fs, 1)
 	require.Equal(t, name, fs[0].Attr(sources.AttrPath))
 	require.Equal(t, "TOKEN_AFTER\n", fs[0].Raw)
@@ -248,9 +248,9 @@ func TestSelectionAndArchives(t *testing.T) {
 	commit("TOKEN_OLD\n", "2001-01-01T00:00:00Z")
 	commit("TOKEN_NEW\n", "2001-01-03T00:00:00Z")
 	date := time.Date(2001, 1, 2, 0, 0, 0, 0, time.UTC)
-	require.Equal(t, map[string]string{"TOKEN_NEW\n": "file:1"}, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Since: &date})))
-	require.Equal(t, map[string]string{"TOKEN_OLD\n": "file:1"}, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, Until: &date})))
-	require.Equal(t, map[string]string{"TOKEN_NEW\n": "file:1"}, textOccurrences(collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, MaxCount: 1})))
+	require.Equal(t, map[string]string{"TOKEN_NEW\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: repo, Since: &date})))
+	require.Equal(t, map[string]string{"TOKEN_OLD\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: repo, Until: &date})))
+	require.Equal(t, map[string]string{"TOKEN_NEW\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: repo, MaxCount: 1})))
 	zipFile, err := os.Create(filepath.Join(repo, "archive.zip"))
 	require.NoError(t, err)
 	writer := zip.NewWriter(zipFile)
@@ -262,7 +262,7 @@ func TestSelectionAndArchives(t *testing.T) {
 	require.NoError(t, zipFile.Close())
 	gitFixture(t, repo, "add", ".")
 	gitFixture(t, repo, "commit", "-qm", "archive")
-	fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo, MaxCount: 1, MaxArchiveDepth: 1})
+	fs := collect(t, &Source{RepoPath: repo, MaxCount: 1, MaxArchiveDepth: 1})
 	require.Equal(t, map[string]string{"TOKEN_ARCHIVE\n": "archive.zip!secret.txt:1"}, textOccurrences(fs))
 }
 
@@ -276,7 +276,7 @@ func TestSHA256(t *testing.T) {
 	gitFixture(t, repo, "add", ".")
 	gitFixture(t, repo, "commit", "-qm", "root")
 	gitFixture(t, repo, "repack", "-ad")
-	fs := collect(t, &Source{Exclude: []string{"loose-objects"}, RepoPath: repo})
+	fs := collect(t, &Source{RepoPath: repo})
 	require.Len(t, fs, 1)
 	require.Len(t, fs[0].Attr(AttrBlobSHA), 64)
 	require.Len(t, fs[0].Attr(sources.AttrGitSHA), 64)
@@ -463,23 +463,23 @@ func TestAllHistoryCoverage(t *testing.T) {
 				}
 				return result
 			}
-			actual := messages(&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, All: true})
+			actual := messages(&Source{RepoPath: repo, All: true})
 			require.Len(t, actual, len(expected))
 			for _, sha := range expected {
 				require.Equal(t, 1, actual[sha], "missing or repeated commit %s", sha)
 			}
 			require.Contains(t, actual, side)
 			require.Contains(t, actual, orphan)
-			limited := messages(&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, All: true, MaxCount: 1})
+			limited := messages(&Source{RepoPath: repo, All: true, MaxCount: 1})
 			require.Equal(t, map[string]int{shared: 1}, limited)
 			since := time.Date(2009, 1, 1, 0, 0, 0, 0, time.UTC)
-			selected := messages(&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, All: true, Since: &since})
+			selected := messages(&Source{RepoPath: repo, All: true, Since: &since})
 			require.Equal(t, map[string]int{side: 1, merge: 1, shared: 1}, selected)
 			// Invalid refs must not be quietly skipped as upstream's All iterator does.
 			missing := strings.Repeat("1", len(root))
 			gitFixture(t, repo, "update-ref", "refs/heads/broken", root)
 			require.NoError(t, os.WriteFile(filepath.Join(repo, ".git", "refs", "heads", "broken"), []byte(missing+"\n"), 0644))
-			err := (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			err := (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 			require.ErrorContains(t, err, "broken")
 			gitFixture(t, repo, "update-ref", "-d", "refs/heads/broken")
 			// A syntactically valid commit can still name an unavailable parent.
@@ -490,7 +490,7 @@ func TestAllHistoryCoverage(t *testing.T) {
 			written, err := write.CombinedOutput()
 			require.NoError(t, err, "%s", written)
 			gitFixture(t, repo, "update-ref", "refs/heads/incomplete", strings.TrimSpace(string(written)))
-			err = (&Source{Exclude: []string{"loose-objects"}, RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			err = (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 			require.ErrorContains(t, err, "parent "+missing)
 		})
 	}
@@ -588,19 +588,19 @@ func BenchmarkHistory(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for range b.N {
-		s := &Source{Exclude: []string{"loose-objects"}, RepoPath: path, All: true}
+		s := &Source{RepoPath: path, All: true}
 		r, _, close, err := s.open(b.Context())
 		if err != nil {
 			b.Fatal(err)
 		}
-		h, err := s.history(b.Context(), r)
+		h, err := s.history(b.Context(), r, scanPatches)
 		if err != nil {
 			close()
 			b.Fatal(err)
 		}
 		n, frontier := 0, 0
 		for {
-			_, err := h.next(b.Context())
+			_, _, err := h.next(b.Context())
 			if err == io.EOF {
 				break
 			}
@@ -618,7 +618,7 @@ func BenchmarkHistory(b *testing.B) {
 }
 
 //nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
-func TestLooseBlobsAndNotesWithoutGit(t *testing.T) {
+func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
 	gitFixture(t, repo, "config", "user.name", "Note Author")
@@ -637,7 +637,7 @@ func TestLooseBlobsAndNotesWithoutGit(t *testing.T) {
 	gitFixture(t, repo, "reset", "-q", "HEAD", "uncommitted")
 	require.NoError(t, os.Remove(filepath.Join(repo, "uncommitted")))
 	t.Setenv("PATH", t.TempDir())
-	fs := collect(t, &Source{RepoPath: repo, All: true, Include: []string{"commit-messages", "notes"}})
+	fs := collect(t, &Source{RepoPath: repo, All: true, Include: []string{"commit-messages", "notes", "unreachable-objects"}})
 	var notes []string
 	var blobs, patches, messages int
 	for _, f := range fs {
@@ -651,7 +651,7 @@ func TestLooseBlobsAndNotesWithoutGit(t *testing.T) {
 			if f.Raw == "NOTE_OLD_SECRET\n" {
 				require.Equal(t, firstNoteCommit, f.Attr(sources.AttrGitSHA))
 			}
-		case sources.ResourceGitLooseBlob:
+		case sources.ResourceGitBlob:
 			blobs++
 			require.Equal(t, "LOOSE_SECRET\n", f.Raw)
 			require.Equal(t, looseID, f.Attr(AttrBlobSHA))
@@ -667,11 +667,11 @@ func TestLooseBlobsAndNotesWithoutGit(t *testing.T) {
 	require.Equal(t, 1, blobs)
 	require.Equal(t, 1, patches)
 	require.Equal(t, 1, messages)
-	fs = collect(t, &Source{RepoPath: repo, All: true, Exclude: []string{"loose-objects"}})
+	fs = collect(t, &Source{RepoPath: repo, All: true})
 	require.Len(t, fs, 1)
 	require.Equal(t, "COMMITTED_SECRET\n", fs[0].Raw)
 	stop := errors.New("stop loose")
-	err := (&Source{RepoPath: repo, All: true, Prefilter: func(a map[string]string) bool { return a[sources.AttrResource] != sources.ResourceGitLooseBlob }}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
+	err := (&Source{RepoPath: repo, All: true, Include: []string{"unreachable-objects"}, Prefilter: func(a map[string]string) bool { return a[sources.AttrResource] != sources.ResourceGitBlob }}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
 	require.ErrorIs(t, err, stop)
 }
 
@@ -692,10 +692,10 @@ func TestUnbornLooseArchive(t *testing.T) {
 	require.NoError(t, os.Remove(name))
 	t.Setenv("PATH", t.TempDir())
 	for _, all := range []bool{false, true} {
-		fs := collect(t, &Source{RepoPath: repo, All: all, MaxArchiveDepth: 1})
+		fs := collect(t, &Source{RepoPath: repo, All: all, Include: []string{"unreachable-objects"}, MaxArchiveDepth: 1})
 		require.Len(t, fs, 1)
 		require.Equal(t, "LOOSE_ARCHIVE_SECRET\n", fs[0].Raw)
-		require.Equal(t, sources.ResourceGitLooseBlob, fs[0].Attr(sources.AttrResource))
+		require.Equal(t, sources.ResourceGitBlob, fs[0].Attr(sources.AttrResource))
 		require.Equal(t, id, fs[0].Attr(AttrBlobSHA))
 		require.Contains(t, fs[0].Attr(sources.AttrPath), "secret.txt")
 		require.Empty(t, fs[0].Attr(sources.AttrGitSHA))
@@ -715,7 +715,7 @@ func TestPackedNotesInWorktree(t *testing.T) {
 	require.NoError(t, os.WriteFile(name, []byte("WORKTREE_LOOSE_SECRET\n"), 0600))
 	id := gitFixture(t, worktree, "hash-object", "-w", name)
 	t.Setenv("PATH", t.TempDir())
-	fs := collect(t, &Source{RepoPath: worktree, Include: []string{"notes"}, Prefilter: func(a map[string]string) bool {
+	fs := collect(t, &Source{RepoPath: worktree, Include: []string{"notes", "unreachable-objects"}, Prefilter: func(a map[string]string) bool {
 		return a[sources.AttrResource] == sources.ResourceGitPatchContent
 	}})
 	require.Len(t, fs, 2)
@@ -724,7 +724,7 @@ func TestPackedNotesInWorktree(t *testing.T) {
 		case sources.ResourceGitNote:
 			require.Equal(t, "PACKED_NOTE_SECRET\n", f.Raw)
 			require.Equal(t, "refs/notes/review", f.Attr("git.notes_ref"))
-		case sources.ResourceGitLooseBlob:
+		case sources.ResourceGitBlob:
 			require.Equal(t, "WORKTREE_LOOSE_SECRET\n", f.Raw)
 			require.Equal(t, id, f.Attr(AttrBlobSHA))
 		default:
@@ -744,7 +744,7 @@ func TestGitResourceSelection(t *testing.T) {
 	gitFixture(t, repo, "add", "file")
 	gitFixture(t, repo, "commit", "-qm", "MESSAGE_SECRET")
 	gitFixture(t, repo, "notes", "add", "-m", "NOTE_SECRET")
-	// Pack reachable objects so loose-only coverage is unambiguous.
+	// Exercise packed reachable content alongside a loose unreachable blob.
 	gitFixture(t, repo, "gc")
 	require.NoError(t, os.WriteFile(file, []byte("LOOSE_SECRET\n"), 0600))
 	gitFixture(t, repo, "hash-object", "-w", file)
@@ -754,17 +754,21 @@ func TestGitResourceSelection(t *testing.T) {
 		include, exclude []string
 		want             []string
 	}{
-		{"default", nil, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n"}},
-		{"explicit defaults", []string{"history", "loose-objects"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n"}},
-		{"add messages", []string{"commit-messages"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n", "MESSAGE_SECRET\n"}},
-		{"add notes", []string{"notes"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n", "NOTE_SECRET\n"}},
-		{"everything", []string{"notes", "commit-messages"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n", "MESSAGE_SECRET\n", "NOTE_SECRET\n"}},
-		{"history only", nil, []string{"loose-objects"}, []string{"HISTORY_SECRET\n"}},
-		{"messages only", []string{"commit-messages"}, []string{"history", "loose-objects"}, []string{"MESSAGE_SECRET\n"}},
-		{"notes only", []string{"notes"}, []string{"history", "loose-objects"}, []string{"NOTE_SECRET\n"}},
-		{"messages and notes", []string{"commit-messages", "notes"}, []string{"history", "loose-objects"}, []string{"MESSAGE_SECRET\n", "NOTE_SECRET\n"}},
-		{"loose only", nil, []string{"history"}, []string{"LOOSE_SECRET\n"}},
-		{"exclude optional resources", nil, []string{"commit-messages", "notes"}, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n"}},
+		{"default", nil, nil, []string{"HISTORY_SECRET\n"}},
+		{"explicit default", []string{"history"}, nil, []string{"HISTORY_SECRET\n"}},
+		{"add messages", []string{"commit-messages"}, nil, []string{"HISTORY_SECRET\n", "MESSAGE_SECRET\n"}},
+		{"add notes", []string{"notes"}, nil, []string{"HISTORY_SECRET\n", "NOTE_SECRET\n"}},
+		{"add unreachable", []string{"unreachable-objects"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n"}},
+		{"everything", []string{"notes", "commit-messages", "unreachable-objects"}, nil, []string{"HISTORY_SECRET\n", "LOOSE_SECRET\n", "MESSAGE_SECRET\n", "NOTE_SECRET\n"}},
+		{"exclude optional resources", nil, []string{"objects", "unreachable-objects", "commit-messages", "notes"}, []string{"HISTORY_SECRET\n"}},
+		{"messages only", []string{"commit-messages"}, []string{"history"}, []string{"MESSAGE_SECRET\n"}},
+		{"notes only", []string{"notes"}, []string{"history"}, []string{"NOTE_SECRET\n"}},
+		{"messages and notes", []string{"commit-messages", "notes"}, []string{"history"}, []string{"MESSAGE_SECRET\n", "NOTE_SECRET\n"}},
+		{"unreachable only", []string{"unreachable-objects"}, []string{"history"}, []string{"LOOSE_SECRET\n"}},
+		{"objects only", []string{"objects"}, []string{"history"}, []string{"HISTORY_SECRET\n", "NOTE_SECRET\n", "LOOSE_SECRET\n"}},
+		{"objects subsume unreachable", []string{"objects", "unreachable-objects"}, []string{"history"}, []string{"HISTORY_SECRET\n", "NOTE_SECRET\n", "LOOSE_SECRET\n"}},
+		{"objects independent of unreachable exclusion", []string{"objects"}, []string{"history", "unreachable-objects"}, []string{"HISTORY_SECRET\n", "NOTE_SECRET\n", "LOOSE_SECRET\n"}},
+		{"objects plus history", []string{"objects"}, nil, []string{"HISTORY_SECRET\n", "HISTORY_SECRET\n", "NOTE_SECRET\n", "LOOSE_SECRET\n"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
@@ -777,13 +781,13 @@ func TestGitResourceSelection(t *testing.T) {
 	for _, s := range []Source{
 		{Include: []string{"unknown"}}, {Exclude: []string{"unknown"}},
 		{Include: []string{""}}, {Exclude: []string{""}},
-		{Exclude: []string{"history", "loose-objects"}},
-		{Exclude: []string{"history", "loose-objects", "notes", "commit-messages"}},
+		{Exclude: []string{"history"}},
+		{Exclude: []string{"history", "notes", "commit-messages"}},
 	} {
 		s.RepoPath = repo
 		require.Error(t, s.Validate())
 	}
-	for _, resource := range []string{"history", "merges", "loose-objects", "notes", "commit-messages", "tag-messages", "reflog-messages", "reflog-history"} {
+	for _, resource := range []string{"history", "merges", "objects", "unreachable-objects", "notes", "commit-messages", "tag-messages", "reflog-messages", "reflog-history"} {
 		s := &Source{RepoPath: repo, Include: []string{resource}, Exclude: []string{resource}}
 		require.ErrorContains(t, s.Validate(), "both included and excluded")
 	}
@@ -805,23 +809,54 @@ func TestExcludedGitResourcesAreNotRead(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	// Messages need commits but not their trees or file blobs.
 	require.NoError(t, os.Remove(filepath.Join(repo, ".git", "objects", treeID[:2], treeID[2:])))
-	messages := &Source{RepoPath: repo, Include: []string{"commit-messages"}, Exclude: []string{"history", "loose-objects"}}
+	messages := &Source{RepoPath: repo, Include: []string{"commit-messages"}, Exclude: []string{"history"}}
 	fs := collect(t, messages)
 	require.Len(t, fs, 1)
 	require.Equal(t, "MESSAGE_SECRET\n", fs[0].Raw)
 	stop := errors.New("consumer stopped")
 	require.ErrorIs(t, messages.Fragments(t.Context(), func(sources.Fragment, error) error { return stop }), stop)
-	err := (&Source{RepoPath: repo, Exclude: []string{"loose-objects"}}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+	err := (&Source{RepoPath: repo}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 	require.Error(t, err, "history would need the removed tree")
-	// Neither notes nor loose-only scans need the ordinary HEAD commit.
+	// Neither notes nor all-object scans need the ordinary HEAD commit.
 	require.NoError(t, os.Remove(filepath.Join(repo, ".git", "objects", commitID[:2], commitID[2:])))
-	fs = collect(t, &Source{RepoPath: repo, All: true, Include: []string{"notes"}, Exclude: []string{"history", "loose-objects"}})
+	fs = collect(t, &Source{RepoPath: repo, All: true, Include: []string{"notes"}, Exclude: []string{"history"}})
 	require.Len(t, fs, 1)
 	require.Equal(t, "NOTE_SECRET\n", fs[0].Raw)
-	fs = collect(t, &Source{RepoPath: repo, All: true, Exclude: []string{"history"}})
+	fs = collect(t, &Source{RepoPath: repo, All: true, Include: []string{"objects"}, Exclude: []string{"history"}})
 	var raw []string
 	for _, f := range fs {
 		raw = append(raw, f.Raw)
 	}
 	require.ElementsMatch(t, []string{"LOOSE_SECRET\n", "NOTE_SECRET\n"}, raw)
+	err = (&Source{RepoPath: repo, Include: []string{"unreachable-objects"}, Exclude: []string{"history"}}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+	require.ErrorContains(t, err, "missing from object inventory", "broken reachability must not turn reachable blobs into unreachable ones")
+}
+
+//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
+func TestObjectScanCancellationAndLinks(t *testing.T) {
+	repo := t.TempDir()
+	gitFixture(t, repo, "init", "-q")
+	file := filepath.Join(repo, "file")
+	require.NoError(t, os.WriteFile(file, []byte("OBJECT_SECRET\n"), 0600))
+	id := gitFixture(t, repo, "hash-object", "-w", file)
+	t.Setenv("PATH", t.TempDir())
+	for _, resource := range []string{"objects", "unreachable-objects"} {
+		s := &Source{RepoPath: repo, Include: []string{resource}, Exclude: []string{"history"}}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, s.Fragments(ctx, func(sources.Fragment, error) error { t.Fatal("yield after cancellation"); return nil }), context.Canceled)
+		stop := errors.New("stop")
+		require.ErrorIs(t, s.Fragments(t.Context(), func(sources.Fragment, error) error { return stop }), stop)
+	}
+	path := filepath.Join(repo, ".git", "objects", id[:2], id[2:])
+	outside := filepath.Join(t.TempDir(), "object")
+	require.NoError(t, os.Rename(path, outside))
+	require.NoError(t, os.Symlink(outside, path))
+	s := &Source{RepoPath: repo, Include: []string{"objects"}, Exclude: []string{"history"}}
+	require.ErrorContains(t, s.Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from linked object"); return nil }), "not a regular file")
+	require.NoError(t, os.Remove(path))
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Remove(dir))
+	require.NoError(t, os.Symlink(filepath.Dir(outside), dir))
+	require.ErrorContains(t, s.Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from linked object directory"); return nil }), "not a directory")
 }

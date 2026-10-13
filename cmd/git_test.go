@@ -46,7 +46,7 @@ func TestGitBinaryArchiveMembersIncluded(t *testing.T) {
 	configPath := writeTestConfig(t, "[[rules]]\nid='archive-secret'\nregex='SECRET_[A-Z_]+'\n")
 
 	root, stdout := newTestCLI(t)
-	root.SetArgs([]string{"git", repo, "--exclude=loose-objects", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"})
+	root.SetArgs([]string{"git", repo, "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"})
 	require.NoError(t, root.Execute())
 	_, findings := decodeScanJSON(t, stdout.Bytes())
 	var values []string
@@ -89,7 +89,7 @@ func TestGitFindingURLs(t *testing.T) {
 
 			t.Setenv("PATH", t.TempDir())
 			root, stdout := newTestCLI(t)
-			args := []string{"git", repo, "--include=commit-messages", "--exclude=loose-objects", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
+			args := []string{"git", repo, "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
 			if tc.platform != "" {
 				args = append(args, "--platform="+tc.platform)
 			}
@@ -171,7 +171,7 @@ func TestGitIncludeMerges(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("workers=%d/%s", workers, tc.name), func(t *testing.T) {
 				root, stdout := newTestCLI(t)
-				args := []string{"git", repo, fmt.Sprintf("--git-workers=%d", workers), "--include=commit-messages", "--exclude=loose-objects", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
+				args := []string{"git", repo, fmt.Sprintf("--git-workers=%d", workers), "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
 				if tc.flag != "" {
 					args = append(args, tc.flag)
 				}
@@ -226,7 +226,7 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, stdout := newTestCLI(t)
-			args := append([]string{"git", repo, "--exclude=loose-objects", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}, tc.args...)
+			args := append([]string{"git", repo, "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}, tc.args...)
 			root.SetArgs(args)
 			require.NoError(t, root.Execute())
 			_, findings := decodeScanJSON(t, stdout.Bytes())
@@ -242,7 +242,7 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 //nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestGoGitOptionValidation(t *testing.T) {
 	for _, cmd := range []GitCmd{
-		{Exclude: []string{"unknown"}}, {Exclude: []string{"history", "loose-objects"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
+		{Exclude: []string{"unknown"}}, {Exclude: []string{"history"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
 		{All: true, Revision: "HEAD"}, {GitCacheMiB: -1}, {GitCacheMiB: 4097},
 		{GitWorkers: -1}, {GitWorkers: 17}, {GitDiskCacheMiB: -2}, {GitDiskCacheMiB: 4097},
 	} {
@@ -254,15 +254,15 @@ func TestGoGitOptionValidation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 32, source.CacheMiB)
 	require.Empty(t, source.Exclude, "default resources are not excluded")
-	source, err = (GitCmd{Exclude: []string{"loose-objects"}}).gitSource()
+	source, err = (GitCmd{Include: []string{"objects"}, Exclude: []string{"history"}}).gitSource()
 	require.NoError(t, err)
-	require.Equal(t, []string{"loose-objects"}, source.Exclude)
-	cli, err := parseCLIForTest(t, "git", "--include=commit-messages,notes", "--exclude=history,loose-objects")
+	require.Equal(t, []string{"history"}, source.Exclude)
+	cli, err := parseCLIForTest(t, "git", "--include=commit-messages,notes", "--exclude=history")
 	require.NoError(t, err)
 	source, err = cli.Git.gitSource()
 	require.NoError(t, err)
 	require.Equal(t, []string{"commit-messages", "notes"}, source.Include)
-	require.Equal(t, []string{"history", "loose-objects"}, source.Exclude)
+	require.Equal(t, []string{"history"}, source.Exclude)
 	require.NoError(t, source.Validate())
 
 	source, err = (GitCmd{GitDiskCacheMiB: -1}).gitSource()

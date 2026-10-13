@@ -24,10 +24,9 @@ import (
 )
 
 // Source scans HEAD's reachable history by default. Merges are compared against
-// their first parent. Include adds resources to the defaults (history and
-// loose-objects, with merge patches enabled); Exclude removes resources.
-// Conflicts and empty selections are rejected. Supplemental loose blobs have
-// no path or commit attribution.
+// their first parent. Include adds resources to the default history scan;
+// Exclude removes resources. Conflicts and empty selections are rejected.
+// Object scans read full blobs without path or commit attribution.
 // Diff boundaries and rename choices can differ from Git's xdiff implementation.
 // Traversal retains one visited object ID per discovered commit, not every
 // decoded commit. Worker queues and object/tree caches have separate bounds.
@@ -58,7 +57,7 @@ type Source struct {
 	// error, rather than silently omitting content. It bounds diff inputs, not
 	// go-git's internal delta reconstruction or the process's complete RSS.
 	MaxBlobBytes int64
-	// Include and Exclude accept history, merges, loose-objects, commit-messages,
+	// Include and Exclude accept history, merges, objects, unreachable-objects, commit-messages,
 	// notes, tag-messages, reflog-messages, and reflog-history.
 	Include, Exclude []string
 	Prefilter        sources.PrefilterFunc
@@ -97,19 +96,20 @@ func (s *Source) Validate() error {
 
 func (s *Source) resources() (map[string]bool, error) {
 	selected := map[string]bool{
-		sources.GitResourceTypeHistory:        true,
-		sources.GitResourceTypeMerges:         true,
-		sources.GitResourceTypeLooseObjects:   true,
-		sources.GitResourceTypeCommitMessages: false,
-		sources.GitResourceTypeNotes:          false,
-		sources.GitResourceTypeTagMessages:    false,
-		sources.GitResourceTypeReflogMessages: false,
-		sources.GitResourceTypeReflogHistory:  false,
+		sources.GitResourceTypeHistory:            true,
+		sources.GitResourceTypeMerges:             true,
+		sources.GitResourceTypeObjects:            false,
+		sources.GitResourceTypeUnreachableObjects: false,
+		sources.GitResourceTypeCommitMessages:     false,
+		sources.GitResourceTypeNotes:              false,
+		sources.GitResourceTypeTagMessages:        false,
+		sources.GitResourceTypeReflogMessages:     false,
+		sources.GitResourceTypeReflogHistory:      false,
 	}
 	for _, list := range [][]string{s.Include, s.Exclude} {
 		for _, name := range list {
 			if _, known := selected[name]; !known {
-				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, merges, loose-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history", name)
+				return nil, fmt.Errorf("unsupported Git resource %q; supported: history, merges, objects, unreachable-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history", name)
 			}
 		}
 	}
@@ -164,50 +164,44 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 		resolved.Platform, resolved.RemoteURL = s.resolveRemote(r)
 	}
 	store := r.Storer.(*objectStorage)
-	var loose *looseObjects
-	if resources[sources.GitResourceTypeLooseObjects] {
-		loose, err = findLoose(ctx, store)
+	var ordinary commitResources
+	if resources[sources.GitResourceTypeHistory] {
+		ordinary |= scanPatches
+	}
+	if resources[sources.GitResourceTypeCommitMessages] {
+		ordinary |= scanMessages
+	}
+	var walk *history
+	if ordinary != 0 {
+		walk, err = resolved.history(ctx, r, ordinary)
 		if err != nil {
 			return err
 		}
-	}
-	var walk *history
-	if resources[sources.GitResourceTypeHistory] || (resources[sources.GitResourceTypeCommitMessages] && !resources[sources.GitResourceTypeReflogHistory]) {
-		walk, err = resolved.history(ctx, r)
-		if err != nil {
+		if err := resolved.commits(ctx, r, walk, false, yield); err != nil {
 			return err
 		}
 	} else if resources[sources.GitResourceTypeReflogHistory] {
-		walk = &history{r: r, seen: make(map[plumbing.Hash]struct{}), frontier: nil, sequence: 0}
-	}
-	// Finish ordinary history first. Its loose-object exclusions must not
-	// depend on optional reflog coverage: a patch scans additions, whereas the
-	// supplemental loose pass scans whole blobs, including inherited content.
-	selected := 0
-	if walk != nil && len(walk.frontier) > 0 {
-		selected, err = resolved.commits(ctx, r, walk, loose, yield)
-		if err != nil {
-			return err
-		}
+		walk = &history{r: r, seen: make(map[plumbing.Hash]commitResources), scope: 0, selected: 0, frontier: nil, sequence: 0}
 	}
 	if resources[sources.GitResourceTypeReflogHistory] || resources[sources.GitResourceTypeReflogMessages] {
 		var tips *history
 		if resources[sources.GitResourceTypeReflogHistory] {
 			tips = walk
+			// A count limit can leave queued ordinary commits. Drop that queue;
+			// only reflog roots may request patches when history is excluded.
+			walk.frontier = nil
+			walk.scope = scanPatches | ordinary&scanMessages
 		}
 		if err := resolved.reflogs(ctx, store, tips, resources[sources.GitResourceTypeReflogMessages], yield); err != nil {
 			return err
 		}
 	}
-	if resources[sources.GitResourceTypeReflogHistory] && (s.MaxCount == 0 || selected < s.MaxCount) {
-		// Reuse the visited set, but do not let the added patches suppress any
-		// default loose-blob fragments. Keep one count budget across both passes,
-		// giving ordinary history priority so --include cannot displace it.
-		extra := resolved
-		if extra.MaxCount > 0 {
-			extra.MaxCount -= selected
-		}
-		if _, err := extra.commits(ctx, r, walk, nil, yield); err != nil {
+	if resources[sources.GitResourceTypeReflogHistory] {
+		// Messages-only commits may still need reflog patches, even after the
+		// count budget is spent. Their metadata is revisited but messages are
+		// never emitted twice, and no file tree is compared twice.
+		revisit := ordinary == scanMessages
+		if err := resolved.commits(ctx, r, walk, revisit, yield); err != nil {
 			return err
 		}
 	}
@@ -217,14 +211,17 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 		}
 	}
 	if resources[sources.GitResourceTypeNotes] {
-		if err := resolved.notes(ctx, r, loose, yield); err != nil {
+		if err := resolved.notes(ctx, r, yield); err != nil {
 			return err
 		}
 	}
-	return resolved.looseBlobs(ctx, store, loose, yield)
+	if resources[sources.GitResourceTypeObjects] || resources[sources.GitResourceTypeUnreachableObjects] {
+		return resolved.blobs(ctx, r, !resources[sources.GitResourceTypeObjects], yield)
+	}
+	return ctx.Err()
 }
 
-func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, loose *looseObjects, yield sources.FragmentsFunc) (int, error) {
+func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, revisit bool, yield sources.FragmentsFunc) error {
 	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
@@ -238,11 +235,15 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 	}
 	// The producer owns traversal; at most one queued commit per worker.
 	group, workCtx := errgroup.WithContext(ctx)
-	jobs := make(chan *object.Commit, workers)
+	type job struct {
+		commit    *object.Commit
+		resources commitResources
+	}
+	jobs := make(chan job, workers)
 	for range workers {
 		group.Go(func() error {
 			var differ lineDiffer
-			w := worker{source: s, trees: trees, store: r.Storer.(*objectStorage), maxBlob: maxBlob, patches: patches, loose: loose, differ: differ}
+			w := worker{source: s, trees: trees, store: r.Storer.(*objectStorage), maxBlob: maxBlob, patches: patches, differ: differ}
 			for {
 				select {
 				case <-workCtx.Done():
@@ -251,21 +252,20 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 					if !ok {
 						return nil
 					}
-					if err := w.commit(workCtx, c, yield); err != nil {
-						return fmt.Errorf("commit %s: %w", c.Hash, err)
+					if err := w.commit(workCtx, c.commit, c.resources, yield); err != nil {
+						return fmt.Errorf("commit %s: %w", c.commit.Hash, err)
 					}
 				}
 			}
 		})
 	}
-	selected := 0
 	group.Go(func() error {
 		defer close(jobs)
-		for s.MaxCount == 0 || selected < s.MaxCount {
+		for revisit || s.MaxCount == 0 || history.selected < s.MaxCount {
 			if err := workCtx.Err(); err != nil {
 				return err
 			}
-			c, e := history.next(workCtx)
+			c, resources, e := history.next(workCtx)
 			if errors.Is(e, io.EOF) {
 				return nil
 			}
@@ -275,9 +275,15 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 			if !accept(c) {
 				continue
 			}
-			selected++
+			if history.seen[c.Hash]&commitSelected == 0 {
+				if s.MaxCount > 0 && history.selected >= s.MaxCount {
+					continue
+				}
+				history.selected++
+				history.seen[c.Hash] |= commitSelected
+			}
 			select {
-			case jobs <- c:
+			case jobs <- job{c, resources}:
 			case <-workCtx.Done():
 				return workCtx.Err()
 			}
@@ -288,7 +294,7 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 	if s.Logger != nil {
 		s.Logger.Debug("git text patch cache", "hits", patches.hits, "misses", patches.misses, "entries", len(patches.entries), "bytes", patches.bytes)
 	}
-	return selected, err
+	return err
 }
 
 func (s *Source) selector() func(*object.Commit) bool {
@@ -315,10 +321,9 @@ type worker struct {
 	maxBlob int64
 	differ  lineDiffer
 	patches *patchCache
-	loose   *looseObjects
 }
 
-func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.FragmentsFunc) error {
+func (w *worker) commit(ctx context.Context, c *object.Commit, resources commitResources, yield sources.FragmentsFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -327,7 +332,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 		attrs[sources.AttrGitRemoteURL] = w.source.RemoteURL
 		attrs[sources.AttrGitPlatform] = w.source.Platform.String()
 	}
-	if slices.Contains(w.source.Include, sources.GitResourceTypeCommitMessages) {
+	if resources&scanMessages != 0 {
 		messageAttrs := maps.Clone(attrs)
 		messageAttrs[sources.AttrResource] = sources.ResourceGitCommitMessage
 		if w.source.Prefilter == nil || !w.source.Prefilter(messageAttrs) {
@@ -339,7 +344,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 			}
 		}
 	}
-	if (slices.Contains(w.source.Exclude, sources.GitResourceTypeHistory) && !slices.Contains(w.source.Include, sources.GitResourceTypeReflogHistory)) || (slices.Contains(w.source.Exclude, sources.GitResourceTypeMerges) && len(c.ParentHashes) > 1) {
+	if resources&scanPatches == 0 || (slices.Contains(w.source.Exclude, sources.GitResourceTypeMerges) && len(c.ParentHashes) > 1) {
 		return nil
 	}
 	changes, err := treeChanges(ctx, c, w.trees)
@@ -353,7 +358,6 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 		if change.To.Name == "" {
 			continue
 		}
-		w.loose.encountered(change.To.TreeEntry.Hash)
 		fileAttrs := maps.Clone(attrs)
 		fileAttrs[sources.AttrPath] = change.To.Name
 		fileAttrs[sources.AttrResource] = sources.ResourceGitPatchContent

@@ -572,8 +572,8 @@ can differ from Git's implementation.
 ```sh
 betterleaks git .
 betterleaks git . --include=commit-messages,notes
-betterleaks git . --since=2026-01-01 --author='Example <' --exclude=loose-objects
-betterleaks git . --revision=origin/main --exclude=loose-objects
+betterleaks git . --since=2026-01-01 --author='Example <'
+betterleaks git . --revision=origin/main
 betterleaks git https://github.com/owner/repo --include=commit-messages
 ```
 
@@ -586,7 +586,8 @@ to scan are errors.
 |---|---|---|
 | `history` | Added file content across selected commits, from packed or loose objects | On |
 | `merges` | Merge patches against the first parent, within either history resource | On with history |
-| `loose-objects` | Supplemental loose blobs without path or commit attribution | On |
+| `objects` | Complete contents of every stored blob, once per object ID | Off |
+| `unreachable-objects` | Complete blobs outside HEAD and all current refs, whether loose or packed | Off |
 | `commit-messages` | Full messages of selected commits | Off |
 | `notes` | Historical note contents, including versions subsequently removed | Off |
 | `tag-messages` | Annotated-tag messages, including nested annotations | Off |
@@ -595,16 +596,18 @@ to scan are errors.
 
 | Desired scan | Flags |
 |---|---|
-| History only | `--exclude=loose-objects` |
-| History without merge patches | `--exclude=merges,loose-objects` |
+| History only | No flags |
+| History without merge patches | `--exclude=merges` |
 | Add messages to the default scan | `--include=commit-messages` |
-| All supported resources | `--include=commit-messages,notes,tag-messages,reflog-messages,reflog-history` |
-| Messages only | `--include=commit-messages --exclude=history,loose-objects` |
-| Notes only | `--include=notes --exclude=history,loose-objects` |
-| Messages and notes only | `--include=commit-messages,notes --exclude=history,loose-objects` |
-| Loose blobs only | `--exclude=history` |
-| Tag messages only | `--include=tag-messages --exclude=history,loose-objects` |
-| Reflog messages only | `--include=reflog-messages --exclude=history,loose-objects` |
+| All supported resources | `--include=objects,commit-messages,notes,tag-messages,reflog-messages,reflog-history` |
+| Messages only | `--include=commit-messages --exclude=history` |
+| Notes only | `--include=notes --exclude=history` |
+| Messages and notes only | `--include=commit-messages,notes --exclude=history` |
+| All blobs only | `--include=objects --exclude=history` |
+| Unreachable blobs only | `--include=unreachable-objects --exclude=history` |
+| Add unreachable blobs | `--include=unreachable-objects` |
+| Tag messages only | `--include=tag-messages --exclude=history` |
+| Reflog messages only | `--include=reflog-messages --exclude=history` |
 | Include abandoned local history | `--include=reflog-history` |
 
 `merges` controls patches within `history` and `reflog-history`. If neither is
@@ -612,11 +615,15 @@ selected, merge patches are disabled; explicitly including `merges` then is an
 error. Excluding `merges` preserves both parents' histories and any enabled
 commit-message scanning, including merge commit messages.
 
+History (including merge patches) is the sole default. `--exclude=history`
+alone is an error because it leaves nothing selected. `loose-objects` has been
+removed: storage layout does not determine whether content belongs to history.
+
 Messages-only scans do not compare file trees or read file blobs. Notes-only
-and loose-only scans do not traverse ordinary commit history. When history is
-excluded, the loose pass can scan committed file blobs too: it selects loose
-storage, not only unreachable content. Excluding a resource disables that scan
-pass; it does not suppress the same bytes found through another enabled resource.
+and all-object scans do not traverse ordinary commit history. Excluding a
+resource disables that pass; it does not suppress the same content found through
+another enabled resource. In particular, `--include=objects --exclude=unreachable-objects`
+still scans every blob, including unreachable ones.
 
 `--since` and `--until` inclusively filter committer timestamps using RFC3339 or
 YYYY-MM-DD (UTC). `--author` and `--committer` are Go regular expressions over
@@ -624,17 +631,27 @@ YYYY-MM-DD (UTC). `--author` and `--committer` are Go regular expressions over
 and cannot be combined with it. `--max-count` limits selected commits. Timestamp
 filters do not prune ancestry, so backdated commits remain discoverable.
 
-Loose blobs not encountered during selected history scanning are also scanned
-by default, including uncommitted or abandoned content retained in the local
-object database. They use `resource=git.loose_blob` and `git.blob_sha`, with no
-invented filename, author, or commit. These supplemental full-blob scans are
-independent of history selection: use `--exclude=loose-objects` when you want only
-the selected history. They enumerate the repository's own loose object directory,
-not unreachable packed objects or alternate stores. Encountered history versions
-are excluded before path prefiltering to avoid scanning them again without their
-path metadata. The supplemental inventory is capped at one million object IDs;
-exceeding that reports an incomplete scan. Reachable loose objects are always
-read as part of history, regardless of this flag.
+`objects` and `unreachable-objects` scan complete blobs, including binaries and
+archives, through the existing file scanner. They enumerate loose and packed
+objects, including supported alternate stores, and use `resource=git.blob` and
+`git.blob_sha`. No filename, author, or commit is invented. Commit and tag messages
+remain separate resources; raw tree/commit encodings are not scanned as text.
+Selecting both object resources scans each blob once because `objects` contains
+the entire unreachable subset. History patches and full blobs remain distinct
+resources and can produce overlapping findings. Path and commit filters cannot
+supply missing metadata for object findings.
+
+Unreachable means outside **HEAD and all current refs**, including notes and tags
+pointing directly to blobs or trees. Reflogs and the index are deliberately not
+roots, so abandoned history and staged, never-committed content remain eligible.
+This differs from default `git fsck`, which also considers reflogs and the index.
+Date, author, revision, merge, and count filters do not change this classification.
+Excluding history therefore cannot expand the object pass. Classification walks
+commit/tree/tag references without reading reachable blob contents (except blobs
+referenced directly by a ref). Missing reachable objects report incomplete
+coverage rather than being treated as unreachable. The optional classification
+inventory is bounded to eight million object IDs; exceeding it reports an error.
+`objects` avoids that full inventory and enumerates IDs by hash prefix.
 
 `--include=commit-messages` scans each selected commit's full message, including
 empty commits. Findings have `resource=git.commit_message`, commit metadata,
@@ -648,8 +665,7 @@ annotated object), and `git.blob_sha`. Their `git.sha` and author describe the
 **note edit**, not the annotated commit. Date/identity/count filters apply to
 note commits; `--revision` selects ordinary history and commit messages, not notes. Note
 versions are scanned in full and may repeat unchanged text across edits.
-Without `--include=notes`, loose note blobs may still be found as unattributed
-loose content. Notes refs are excluded from ordinary file history.
+With `--include=objects`, note blobs can also be found as unattributed full blobs. Notes refs are excluded from ordinary file history.
 
 
 `--include=tag-messages` reads all local `refs/tags/*` annotations. Lightweight
@@ -670,13 +686,15 @@ or the time a secret was introduced or pushed.
 `--include=reflog-history` adds both old and new reflog IDs as history roots,
 including linked worktrees' journals. Ordinary history is scanned first, then
 additional reflog commits, using one visited set and one `--max-count` budget.
-Shared commits are scanned once; a count limit gives ordinary history priority.
-Adding reflog history preserves the default loose-blob scan: added-line patches
-do not replace whole-blob coverage. An abandoned loose blob can therefore produce
-both a full-blob finding and a commit-attributed patch finding. Date/identity/count
-filters apply to the actual commits; `--revision`
-does not restrict these additional roots. Excluding `history` selects only
-reflog-rooted history; enabled `commit-messages` then uses that same selection.
+Shared messages and patches are emitted once each; a count limit gives ordinary
+history priority. A commit selected for its message can also receive a reflog
+patch without consuming another count slot. Excluding ordinary history can free
+count slots for additional reflog commits, so limited scans can select different
+content. Date/identity/count filters apply to the actual commits; `--revision` does not restrict these
+additional roots. Excluding `history` suppresses ordinary file patches, while
+`commit-messages` continues to scan the selected ordinary refs. Adding
+`reflog-history` adds reflog-rooted patches and, when messages are enabled,
+messages from additional reflog commits. It never removes ordinary messages.
 Reflogs for notes refs can also retain note-edit commits; their tree additions
 appear as ordinary patches in this broad history traversal.
 
@@ -686,8 +704,9 @@ pass compares file trees. Reflog records are streamed with a 1 MiB per-record
 limit and a 64-level directory-depth limit; unsupported links, malformed or
 truncated records, and missing history objects report incomplete coverage.
 Missing journals are normal. Reflogs expire, may be disabled, and are not fetched
-from remotes. These resources cannot recover garbage-collected content or
-unreachable packed objects absent from both refs and reflogs. Scan a stable
+from remotes. Reflog resources cannot recover garbage-collected content or unreachable
+objects absent from both refs and reflogs; the object resources can scan the
+latter if they are still stored. Scan a stable
 repository when possible: concurrent ref updates or garbage collection can
 invalidate a scan.
 
@@ -708,7 +727,7 @@ remote := &gogit.Source{URL: "https://github.com/owner/repo", All: true}
 
 The SDK's zero-value history selection starts at HEAD. Its `Include` and
 `Exclude` slices use the same additive/subtractive resource selection as the CLI.
-For example, `Exclude: []string{"loose-objects"}` disables supplemental scanning.
+For example, `Include: []string{"objects"}, Exclude: []string{"history"}` scans all blobs without history patches.
 Keep configuration immutable while scanning.
 Worker queues and caches are bounded. `--git-workers` defaults to at most eight
 (maximum 16); `--jobs` independently controls detection. Memory/disk cache flags
@@ -721,7 +740,7 @@ Supported fetch remotes generate SCM URLs from local configuration. Use
 `--platform=none` to disable links. Findings without a URL display `local only`
 in terminal output; JSON retains an absent URL, not a fake link. URLs are not
 network-verified: a locally unpublished commit may still produce a URL that
-returns 404. Notes and unattributed loose blobs have no SCM link.
+returns 404. Notes and unattributed blobs have no SCM link.
 
 ### Caller-supplied patches
 

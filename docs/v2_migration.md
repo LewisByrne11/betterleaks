@@ -117,9 +117,11 @@ Git history uses the object reader; `--git-engine`, `--log-opts`, `--staged`,
 `--unstaged`, and `--pre-receive` are removed. Pipe caller-selected patches into
 `stdin --git-diff` for those workflows. See [Git scanning](scanning.md#git) for
 helper-disabling flags and pipeline error handling. `--include=commit-messages,notes`
-adds message resources. Loose blobs are included by default; disable them with
-`--exclude=loose-objects` for a strict history selection. To scan only messages,
-use `--include=commit-messages --exclude=history,loose-objects`. `--include` is
+adds message resources. The default scans history only; add
+`--include=unreachable-objects` for abandoned or uncommitted blobs, or
+`--include=objects` for all stored blobs. The `loose-objects` selector is removed.
+To scan only messages,
+use `--include=commit-messages --exclude=history`. `--include` is
 additive; it never selects an exclusive scan by itself. The standalone
 `--include-merges` and `--no-merge-patches` flags are replaced by
 `--include=merges` and `--exclude=merges`; merge patches remain enabled by default.

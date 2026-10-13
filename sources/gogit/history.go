@@ -20,14 +20,25 @@ import (
 // commits (and their retained pack readers) live only while a worker needs them.
 type history struct {
 	r        *git.Repository
-	seen     map[plumbing.Hash]struct{}
+	seen     map[plumbing.Hash]commitResources
+	scope    commitResources
+	selected int
 	frontier commitHeap
 	sequence uint64
 }
+type commitResources uint8
+
+const (
+	scanMessages commitResources = 1 << iota
+	scanPatches
+	commitSelected // Counts a commit once across resource passes.
+)
+
 type commitPosition struct {
-	id       plumbing.Hash
-	when     int64
-	sequence uint64
+	id        plumbing.Hash
+	when      int64
+	sequence  uint64
+	resources commitResources
 }
 type commitHeap []commitPosition
 
@@ -47,8 +58,8 @@ func (h *commitHeap) Pop() any {
 	return v
 }
 
-func (s *Source) history(ctx context.Context, r *git.Repository) (*history, error) {
-	h := &history{r: r, seen: make(map[plumbing.Hash]struct{})}
+func (s *Source) history(ctx context.Context, r *git.Repository, scope commitResources) (*history, error) {
+	h := &history{r: r, seen: make(map[plumbing.Hash]commitResources), scope: scope, selected: 0, frontier: nil, sequence: 0}
 	if !s.All {
 		revision := s.Revision
 		if revision == "" {
@@ -118,7 +129,7 @@ func (h *history) tip(ctx context.Context, id plumbing.Hash) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, ok := h.seen[id]; ok {
+		if h.seen[id]&h.scope == h.scope {
 			return nil
 		}
 		obj, err := h.r.Storer.EncodedObject(plumbing.AnyObject, id)
@@ -149,34 +160,35 @@ func (h *history) tip(ctx context.Context, id plumbing.Hash) error {
 	return errors.New("annotated tag nesting exceeds 32 levels")
 }
 func (h *history) enqueue(c *object.Commit) {
-	h.seen[c.Hash] = struct{}{}
-	heap.Push(&h.frontier, commitPosition{c.Hash, c.Committer.When.Unix(), h.sequence})
+	resources := h.scope &^ h.seen[c.Hash]
+	h.seen[c.Hash] |= resources
+	heap.Push(&h.frontier, commitPosition{c.Hash, c.Committer.When.Unix(), h.sequence, resources})
 	h.sequence++
 }
-func (h *history) next(ctx context.Context) (*object.Commit, error) {
+func (h *history) next(ctx context.Context) (*object.Commit, commitResources, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(h.frontier) == 0 {
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 	p := heap.Pop(&h.frontier).(commitPosition)
 	c, err := h.r.CommitObject(p.id)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for _, id := range c.ParentHashes {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		if _, ok := h.seen[id]; ok {
+		if h.seen[id]&h.scope == h.scope {
 			continue
 		}
 		parent, err := h.r.CommitObject(id)
 		if err != nil {
-			return nil, fmt.Errorf("parent %s of %s: %w", id, c.Hash, err)
+			return nil, 0, fmt.Errorf("parent %s of %s: %w", id, c.Hash, err)
 		}
 		h.enqueue(parent)
 	}
-	return c, nil
+	return c, p.resources, nil
 }

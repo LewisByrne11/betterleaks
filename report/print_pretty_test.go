@@ -212,7 +212,7 @@ func TestGitLocalOnlyPresentation(t *testing.T) {
 	var f Finding
 	f.RuleID = "test"
 	f.Match.Value, f.Match.Full, f.Match.Line = "token", "token", "token"
-	f.Attributes = map[string]string{"resource": "git.loose_blob", "git.blob_sha": strings.Repeat("a", 40)}
+	f.Attributes = map[string]string{"resource": "git.blob", "git.blob_sha": strings.Repeat("a", 40)}
 	var out bytes.Buffer
 	var options PrettyOptions
 	options.NoColor = true

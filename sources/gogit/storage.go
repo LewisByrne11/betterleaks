@@ -2,7 +2,9 @@ package gogit
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -138,6 +140,24 @@ func (f readOnlyFS) ReadDir(path string) ([]os.DirEntry, error) {
 		return nil, err
 	}
 	clean := filepath.ToSlash(filepath.Clean(path))
+	// Object enumeration must not silently skip a linked fanout directory or
+	// follow a loose object symlink/FIFO while looking for abandoned content.
+	if clean == "objects" {
+		for _, entry := range entries {
+			if len(entry.Name()) == 2 {
+				if _, err := hex.DecodeString(entry.Name()); err == nil && !entry.IsDir() {
+					return nil, fmt.Errorf("loose object directory %q is not a directory", entry.Name())
+				}
+			}
+		}
+	} else if strings.HasPrefix(clean, "objects/") && len(clean) == len("objects/00") {
+		prefix := strings.TrimPrefix(clean, "objects/")
+		for _, entry := range entries {
+			if plumbing.IsHash(prefix+entry.Name()) && !entry.Type().IsRegular() {
+				return nil, fmt.Errorf("loose object %s is not a regular file", prefix+entry.Name())
+			}
+		}
+	}
 	if clean == "refs" || strings.HasPrefix(clean, "refs/") {
 		visible := entries[:0]
 		for _, entry := range entries {
