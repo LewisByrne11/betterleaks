@@ -223,6 +223,7 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 		count int
 	}{
 		{"all refs", nil, 2}, {"head", []string{"--revision=HEAD"}, 1}, {"author", []string{"--author=Side"}, 1}, {"date", []string{"--since=2030-01-01"}, 0},
+		{"commit limit", []string{"--revision=side", "--max-commits=1"}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, stdout := newTestCLI(t)
@@ -243,7 +244,8 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 func TestGoGitOptionValidation(t *testing.T) {
 	for _, cmd := range []GitCmd{
 		{Exclude: []string{"unknown"}}, {Exclude: []string{"history"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
-		{All: true, Revision: "HEAD"}, {GitCacheMiB: -1}, {GitCacheMiB: 4097},
+		{GitCacheMiB: -1}, {GitCacheMiB: 4097},
+		{MaxCommits: -1},
 		{GitWorkers: -1}, {GitWorkers: 17}, {GitDiskCacheMiB: -2}, {GitDiskCacheMiB: 4097},
 	} {
 		require.Error(t, cmd.Validate())

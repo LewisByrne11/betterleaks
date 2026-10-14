@@ -627,8 +627,9 @@ still scans every blob, including unreachable ones.
 
 `--since` and `--until` inclusively filter committer timestamps using RFC3339 or
 YYYY-MM-DD (UTC). `--author` and `--committer` are Go regular expressions over
-`Name <email>`. `--revision` selects a starting revision; `--all` selects all refs
-and cannot be combined with it. `--max-count` limits selected commits. Timestamp
+`Name <email>`. By default, history reachable from all refs is scanned.
+`--revision` selects a starting revision instead (for example, `--revision=HEAD`
+or `--revision=main`). `--max-commits` limits selected commits. Timestamp
 filters do not prune ancestry, so backdated commits remain discoverable.
 
 `objects` and `unreachable-objects` scan complete blobs, including binaries and
@@ -685,7 +686,7 @@ or the time a secret was introduced or pushed.
 
 `--include=reflog-history` adds both old and new reflog IDs as history roots,
 including linked worktrees' journals. Ordinary history is scanned first, then
-additional reflog commits, using one visited set and one `--max-count` budget.
+additional reflog commits, using one visited set and one `--max-commits` budget.
 Shared messages and patches are emitted once each; a count limit gives ordinary
 history priority. A commit selected for its message can also receive a reflog
 patch without consuming another count slot. Excluding ordinary history can free

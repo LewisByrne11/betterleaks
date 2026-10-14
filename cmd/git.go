@@ -24,8 +24,7 @@ type GitCmd struct {
 	Author          string   `group:"source" help:"Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"Go regular expression matching committer name and email."`
 	Revision        string   `group:"source" help:"Starting revision; when omitted, scans all refs."`
-	All             bool     `group:"source" help:"Scan history reachable from all refs (default unless --revision is set)."`
-	MaxCount        int      `group:"source" name:"max-count" help:"Maximum selected commits; zero is unlimited."`
+	MaxCommits      int      `group:"source" name:"max-commits" help:"Maximum selected commits; zero is unlimited."`
 	GitWorkers      int      `group:"source" name:"git-workers" help:"Concurrent history readers (default up to 8; maximum 16)."`
 	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"Cached object content in MiB; zero uses 256 MiB. This is not a process memory limit."`
 	GitDiskCacheMiB int      `group:"source" name:"git-disk-cache-mib" help:"Temporary object cache in MiB; zero uses 1024 MiB, -1 disables. Removed after scanning."`
@@ -135,9 +134,6 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 	if cmd.GitDiskCacheMiB < -1 || cmd.GitDiskCacheMiB > 4096 {
 		return nil, errors.New("--git-disk-cache-mib must be between -1 and 4096")
 	}
-	if cmd.All && cmd.Revision != "" {
-		return nil, errors.New("--all and --revision are mutually exclusive")
-	}
 	repo := cmd.Repo
 	if repo == "" {
 		repo = "."
@@ -149,8 +145,8 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 			token = remoteGitToken(url)
 		}
 	}
-	return &gogit.Source{RepoPath: repo, URL: url, Token: token, Revision: cmd.Revision, All: cmd.All || cmd.Revision == "", Since: since, Until: until,
-		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCount, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB, DiskCacheMiB: cmd.GitDiskCacheMiB,
+	return &gogit.Source{RepoPath: repo, URL: url, Token: token, Revision: cmd.Revision, All: cmd.Revision == "", Since: since, Until: until,
+		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCommits, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB, DiskCacheMiB: cmd.GitDiskCacheMiB,
 		Prefilter: nil, Logger: nil, RemoteURL: "", MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
 }
 
