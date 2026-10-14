@@ -738,9 +738,11 @@ Worker queues and caches are bounded. `--git-workers` defaults to at most eight
 remain available, and `--git-max-blob-mib` bounds diff inputs. These settings are
 not a total process memory limit. SHA-1 and SHA-256 repositories are supported.
 Shallow repositories and relative alternates currently produce explicit
-unsupported errors. A file's edit search has a one-second computation budget;
+unsupported errors. A file's edit search has a one-minute computation budget;
 exceeding it reports an incomplete scan rather than using an approximate patch.
-Cancellation during the edit search is checked when the bounded call returns.
+An earlier context deadline shortens that budget. Cancellation during the edit
+search is checked when the bounded call returns, which can take up to one minute
+without an earlier deadline.
 Each tree comparison permits at most 1,000,000 visited entries, 100,000 changes,
 and 16 MiB of expanded path bytes. Exceeding these limits reports incomplete
 coverage, including for small tree DAGs that expand into very many paths.

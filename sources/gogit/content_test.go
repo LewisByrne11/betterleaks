@@ -119,7 +119,9 @@ func TestExpensiveDiffBudget(t *testing.T) {
 	}
 	for _, cancelDuringSearch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel=%v", cancelDuringSearch), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
+			// Exercise an earlier caller deadline without waiting for the full
+			// one-minute search budget in the test suite.
+			ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
 			defer cancel()
 			if cancelDuringSearch {
 				timer := time.AfterFunc(50*time.Millisecond, cancel)
@@ -132,7 +134,9 @@ func TestExpensiveDiffBudget(t *testing.T) {
 			})
 			if cancelDuringSearch {
 				require.ErrorIs(t, err, context.Canceled)
-			} else {
+			} else if !errors.Is(err, context.DeadlineExceeded) {
+				// The search can hit its shortened budget before the context's
+				// deadline timer runs.
 				require.ErrorContains(t, err, "computation budget")
 			}
 			require.Less(t, time.Since(started), 5*time.Second)

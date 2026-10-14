@@ -228,7 +228,7 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 	// than leaving a background goroutine running after cancellation. Reject
 	// timeout approximations: they must not silently change patch coverage.
 	dmp := diffmatchpatch.New()
-	dmp.DiffTimeout = time.Second
+	dmp.DiffTimeout = time.Minute
 	if deadline, ok := ctx.Deadline(); ok {
 		dmp.DiffTimeout = min(dmp.DiffTimeout, max(time.Until(deadline), time.Nanosecond))
 	}
@@ -238,7 +238,7 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 		return err
 	}
 	if time.Since(started) >= dmp.DiffTimeout {
-		return errors.New("git diff exceeded its one-second computation budget")
+		return errors.New("git diff exceeded its one-minute computation budget")
 	}
 	at := 0
 	for _, chunk := range chunks {
