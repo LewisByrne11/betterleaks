@@ -2,7 +2,6 @@ package gogit
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/betterleaks/betterleaks/v2/sources"
+	"github.com/betterleaks/betterleaks/v2/sources/scm"
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
@@ -28,6 +28,7 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 	defer refs.Close()
 	trees := new(treeCache)
 	trees.r = r
+	store := r.Storer.(*objectStorage)
 	accept := s.selector()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -75,23 +76,20 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 				attrs[sources.AttrResource] = sources.ResourceGitNote
 				attrs["git.notes_ref"], attrs[AttrBlobSHA] = ref.Name().String(), id.String()
 				target := strings.ReplaceAll(change.To.Name, "/", "")
-				if len(target) == 40 {
-					if _, err := hex.DecodeString(target); err == nil {
-						attrs["git.note_target"] = target
-					}
+				if len(target) == id.Size()*2 && plumbing.IsHash(target) {
+					attrs["git.note_target"] = target
 				}
 				if s.Prefilter != nil && s.Prefilter(attrs) {
 					continue
 				}
-				obj, err := r.Storer.EncodedObject(plumbing.BlobObject, id)
+				obj, err := store.read(id, 0)
 				if err != nil {
 					return err
 				}
-				raw, err := readObjectString(ctx, obj, max(s.MaxBlobBytes, 64<<20))
-				if err != nil {
-					return err
+				if obj.kind != plumbing.BlobObject {
+					return plumbing.ErrObjectNotFound
 				}
-				if err := yield(sources.Fragment{Raw: raw, StartLine: 1, Attributes: attrs}, nil); err != nil {
+				if err := yield(sources.Fragment{Raw: obj.raw, StartLine: 1, Attributes: attrs}, nil); err != nil {
 					return err
 				}
 			}
@@ -168,4 +166,33 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 			id = tag.Target
 		}
 	}
+}
+
+// resolveRemote reads only local configuration. Match Git's default fetch
+// remote: the current branch's remote, otherwise the sole remote or origin.
+// Link metadata is optional and must not prevent a history scan.
+func (s *Source) resolveRemote(r *git.Repository) (scm.Platform, string) {
+	if s.Platform == scm.NoPlatform || s.RemoteURL != "" {
+		return scm.ResolveRemoteURL(s.Platform, s.RemoteURL)
+	}
+	cfg, err := r.Config()
+	if err != nil {
+		return s.Platform, ""
+	}
+	name := "origin"
+	if len(cfg.Remotes) == 1 {
+		for n := range cfg.Remotes {
+			name = n
+		}
+	}
+	if head, err := r.Storer.Reference(plumbing.HEAD); err == nil && head.Type() == plumbing.SymbolicReference && head.Target().IsBranch() {
+		if branch := cfg.Branches[head.Target().Short()]; branch != nil && branch.Remote != "" {
+			name = branch.Remote
+		}
+	}
+	remote := cfg.Remotes[name]
+	if remote == nil || len(remote.URLs) == 0 {
+		return s.Platform, ""
+	}
+	return scm.ResolveRemoteURL(s.Platform, remote.URLs[0])
 }

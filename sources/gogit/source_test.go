@@ -1,3 +1,4 @@
+//nolint:exhaustruct // Test fixtures specify only the fields relevant to each scenario.
 package gogit
 
 import (
@@ -7,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,10 +20,7 @@ import (
 	"github.com/betterleaks/betterleaks/v2/sources"
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/stretchr/testify/require"
@@ -97,7 +94,6 @@ func textOccurrences(fs []sources.Fragment) map[string]string {
 	return result
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestSource(t *testing.T) {
 	repo := newHistory(t)
 	expected := map[string]string{"first\nTOKEN_ROOT\nlast\n": "file.txt:1", "TOKEN_CHANGED\n": "file.txt:2", "TOKEN_SIDE\n": "side.txt:1"}
@@ -211,7 +207,6 @@ func TestSource(t *testing.T) {
 	})
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestHistoricalPathNames(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fixture contains a literal backslash filename")
@@ -233,7 +228,6 @@ func TestHistoricalPathNames(t *testing.T) {
 	require.Equal(t, 101, fs[0].StartLine)
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestSelectionAndArchives(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
@@ -270,7 +264,6 @@ func TestSelectionAndArchives(t *testing.T) {
 	require.Equal(t, map[string]string{"TOKEN_ARCHIVE\n": "archive.zip!secret.txt:1"}, textOccurrences(fs))
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestSHA256(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "--object-format=sha256")
@@ -289,11 +282,17 @@ func TestSHA256(t *testing.T) {
 	gitFixture(t, repo, "add", ".")
 	gitFixture(t, repo, "commit", "-qm", "abandoned")
 	gitFixture(t, repo, "reset", "--hard", root)
+	gitFixture(t, repo, "notes", "add", "-m", "NOTE_SHA256")
 	t.Setenv("PATH", t.TempDir())
-	fs = collect(t, &Source{RepoPath: repo, Include: []string{"reflog-history", "reflog-messages"}})
-	var abandoned, messages bool
+	fs = collect(t, &Source{RepoPath: repo, Include: []string{"reflog-history", "reflog-messages", "notes"}})
+	var abandoned, messages, note bool
 	for _, f := range fs {
 		abandoned = abandoned || f.Raw == "ABANDONED_SHA256\n"
+		if f.Attr(sources.AttrResource) == sources.ResourceGitNote {
+			note = true
+			require.Equal(t, "NOTE_SHA256\n", f.Raw)
+			require.Equal(t, root, f.Attr("git.note_target"))
+		}
 		if f.Attr(sources.AttrResource) == sources.ResourceGitReflogMessage {
 			messages = true
 			require.Len(t, f.Attr("git.reflog_old_sha"), 64)
@@ -302,144 +301,11 @@ func TestSHA256(t *testing.T) {
 	}
 	require.True(t, abandoned)
 	require.True(t, messages)
-}
-
-// Test the edit script rather than mirroring the diff implementation: emitted
-// text must refer to the stated destination lines, and everything not emitted
-// must be an ordered subsequence of the parent. No possible addition is lost.
-func TestLineAdditions(t *testing.T) {
-	split := func(text string) []string {
-		if text == "" {
-			return nil
-		}
-		lines := strings.SplitAfter(text, "\n")
-		if lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
-		return lines
-	}
-	check := func(src, dst string) {
-		t.Helper()
-		current := split(dst)
-		added := make([]bool, len(current))
-		previousEnd := 0
-		err := lineAdditions(t.Context(), src, dst, func(text string, line int) error {
-			start := line - 1
-			n := len(split(text))
-			require.GreaterOrEqual(t, start, previousEnd)
-			require.LessOrEqual(t, start+n, len(current))
-			// Split preserving every byte, including a final unterminated line.
-			expected := strings.Join(current[start:start+n], " ")
-			actual := strings.Join(split(text), " ")
-			require.Equal(t, expected, actual)
-			for i := start; i < start+n; i++ {
-				added[i] = true
-			}
-			previousEnd = start + n
-			return nil
-		})
-		require.NoError(t, err)
-		old := split(src)
-		at := 0
-		for i, text := range current {
-			if added[i] {
-				continue
-			}
-			for at < len(old) && old[at] != text {
-				at++
-			}
-			require.Less(t, at, len(old), "retained line not found in ordered parent")
-			at++
-		}
-	}
-	rng := rand.New(rand.NewPCG(13, 27))
-	words := []string{"one\n", "two\n", "two\n", "\n", "unicode-世界\n", "crlf\r\n"}
-	for range 500 {
-		var src, dst strings.Builder
-		for range rng.IntN(60) {
-			src.WriteString(words[rng.IntN(len(words))])
-		}
-		for range rng.IntN(60) {
-			dst.WriteString(words[rng.IntN(len(words))])
-		}
-		check(src.String(), dst.String())
-		check(strings.TrimSuffix(src.String(), "\n"), strings.TrimSuffix(dst.String(), "\n"))
-	}
-	// Large complete rewrites must not spend quadratic time on unmatched lines.
-	var old, current strings.Builder
-	for i := range 70000 {
-		fmt.Fprintf(&old, "old-%d\n", i)
-		fmt.Fprintf(&current, "new-%d\n", i)
-	}
-	check(old.String(), current.String())
-	// Shared tokens cross the Unicode surrogate boundary as well. The final
-	// insertion must retain its original coordinate after matching all of them.
-	var additions []string
-	require.NoError(t, lineAdditions(t.Context(), old.String(), old.String()+"secret\n", func(raw string, line int) error {
-		require.Equal(t, 70001, line)
-		additions = append(additions, raw)
-		return nil
-	}))
-	require.Equal(t, []string{"secret\n"}, additions)
-	require.ErrorContains(t, lineAdditions(t.Context(), strings.Repeat("x\n", 1_000_000), "", func(string, int) error { t.Fatal("oversized line input yielded"); return nil }), "token limit")
-	stop := errors.New("stop")
-	require.ErrorIs(t, lineAdditions(t.Context(), "old\n", "new\n", func(string, int) error { return stop }), stop)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	require.ErrorIs(t, lineAdditions(ctx, "old\n", "new\n", func(string, int) error { t.Fatal("emit after cancel"); return nil }), context.Canceled)
-}
-
-func FuzzLineAdditions(f *testing.F) {
-	f.Add("old\ncommon\n", "new\ncommon\n")
-	f.Add("", "no final newline")
-	f.Add("a\nb\na\n", "b\na\nb\n")
-	f.Fuzz(func(t *testing.T, old, current string) {
-		if len(old)+len(current) > 8192 {
-			t.Skip()
-		}
-		lines := func(text string) []string {
-			if text == "" {
-				return nil
-			}
-			parts := strings.SplitAfter(text, "\n")
-			if parts[len(parts)-1] == "" {
-				parts = parts[:len(parts)-1]
-			}
-			return parts
-		}
-		a, b := lines(old), lines(current)
-		added := make([]bool, len(b))
-		last := 0
-		require.NoError(t, lineAdditions(t.Context(), old, current, func(text string, line int) error {
-			first := line - 1
-			n := len(lines(text))
-			require.GreaterOrEqual(t, first, last)
-			require.LessOrEqual(t, first+n, len(b))
-			require.Equal(t, strings.Join(b[first:first+n], ""), text)
-			for i := first; i < first+n; i++ {
-				added[i] = true
-			}
-			last = first + n
-			return nil
-		}))
-		at := 0
-		for i, text := range b {
-			if added[i] {
-				continue
-			}
-			for at < len(a) && a[at] != text {
-				at++
-			}
-			require.Less(t, at, len(a))
-			at++
-		}
-	})
+	require.True(t, note)
 }
 
 // A timestamp walk can encounter a shared first parent while another merge
 // parent remains queued. Stopping at the shared parent loses that entire branch.
-//
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestAllHistoryCoverage(t *testing.T) {
 	for _, format := range []string{"sha1", "sha256"} {
 		t.Run(format, func(t *testing.T) {
@@ -518,91 +384,8 @@ func TestAllHistoryCoverage(t *testing.T) {
 	}
 }
 
-func TestObjectCacheDoesNotRetainPackReaders(t *testing.T) {
-	c := &objectCache{cache.NewObjectLRU(1024)}
-	id := plumbing.NewHash(strings.Repeat("a", 40))
-	lazy := packfile.NewFSObject(id, plumbing.CommitObject, 0, 1, nil, nil, nil, "", c)
-	c.Put(lazy)
-	_, found := c.Get(id)
-	require.False(t, found)
-	memory := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
-	memory.SetType(plumbing.BlobObject)
-	writer, err := memory.Writer()
-	require.NoError(t, err)
-	_, err = writer.Write([]byte("data"))
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-	c.Put(memory)
-	actual, found := c.Get(memory.Hash())
-	require.True(t, found)
-	require.Same(t, memory, actual)
-	c.Clear()
-	_, found = c.Get(memory.Hash())
-	require.False(t, found)
-}
-
-func TestCachedTextDeltaBase(t *testing.T) {
-	base := &storedObject{kind: plumbing.BlobObject, raw: "abc"}
-	reader, err := base.Reader()
-	require.NoError(t, err)
-	seeker, ok := reader.(io.Seeker)
-	require.True(t, ok)
-	_, err = seeker.Seek(1, io.SeekStart)
-	require.NoError(t, err)
-	raw, err := io.ReadAll(reader)
-	require.NoError(t, err)
-	require.Equal(t, "bc", string(raw))
-	require.NoError(t, reader.Close())
-	_, err = base.Writer()
-	require.Error(t, err)
-	// Copy all three source bytes, then append one literal byte. The source's
-	// cached representation must remain usable by go-git's delta reconstruction.
-	target := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
-	require.NoError(t, packfile.ApplyDelta(target, base, bytes.NewBuffer([]byte{3, 4, 0x90, 3, 1, 'd'})))
-	result, err := target.Reader()
-	require.NoError(t, err)
-	defer result.Close()
-	raw, err = io.ReadAll(result)
-	require.NoError(t, err)
-	require.Equal(t, "abcd", string(raw))
-	require.Equal(t, plumbing.BlobObject, base.Type())
-	require.Equal(t, int64(3), base.Size())
-}
-
-type slowHashObject struct {
-	plumbing.EncodedObject
-	entered, release chan struct{}
-	once             sync.Once
-}
-
-func (o *slowHashObject) Hash() plumbing.Hash {
-	o.once.Do(func() { close(o.entered); <-o.release })
-	return o.EncodedObject.Hash()
-}
-
-func TestObjectHashDoesNotBlockCache(t *testing.T) {
-	c := &objectCache{cache.NewObjectLRU(1024)}
-	seed := &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("1", 40)), raw: "seed"}
-	c.Put(seed)
-	obj := &slowHashObject{EncodedObject: &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
-	put := make(chan struct{})
-	defer func() { close(obj.release); <-put }()
-	go func() { c.Put(obj); close(put) }()
-	<-obj.entered
-	lookup := make(chan bool, 1)
-	go func() { _, ok := c.Get(seed.id); lookup <- ok }()
-	select {
-	case ok := <-lookup:
-		require.True(t, ok)
-	case <-time.After(2 * time.Second):
-		t.Fatal("hashing an unpublished object blocked unrelated cache lookup")
-	}
-}
-
 // Set BETTERLEAKS_GIT_BENCH_REPO to an absolute fixture path. No detector or
 // tree traversal runs here, making graph retention and startup costs visible.
-//
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func BenchmarkHistory(b *testing.B) {
 	path := os.Getenv("BETTERLEAKS_GIT_BENCH_REPO")
 	if path == "" {
@@ -611,13 +394,13 @@ func BenchmarkHistory(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		s := &Source{RepoPath: path, All: true}
-		r, _, close, err := s.open(b.Context())
+		r, cleanup, err := s.open(b.Context())
 		if err != nil {
 			b.Fatal(err)
 		}
 		h, err := s.history(b.Context(), r, scanPatches)
 		if err != nil {
-			close()
+			cleanup()
 			b.Fatal(err)
 		}
 		n, frontier := 0, 0
@@ -627,19 +410,18 @@ func BenchmarkHistory(b *testing.B) {
 				break
 			}
 			if err != nil {
-				close()
+				cleanup()
 				b.Fatal(err)
 			}
 			n++
 			frontier = max(frontier, len(h.frontier))
 		}
-		close()
+		cleanup()
 		b.ReportMetric(float64(n), "commits/op")
 		b.ReportMetric(float64(frontier), "frontier/op")
 	}
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
@@ -697,7 +479,6 @@ func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 	require.ErrorIs(t, err, stop)
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestUnbornLooseArchive(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
@@ -726,7 +507,6 @@ func TestUnbornLooseArchive(t *testing.T) {
 	require.ErrorContains(t, err, "resolve revision")
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestPackedNotesInWorktree(t *testing.T) {
 	repo := newHistory(t)
 	gitFixture(t, repo, "notes", "--ref=review", "add", "-m", "PACKED_NOTE_SECRET")
@@ -755,7 +535,6 @@ func TestPackedNotesInWorktree(t *testing.T) {
 	}
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestGitResourceSelection(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
@@ -815,7 +594,6 @@ func TestGitResourceSelection(t *testing.T) {
 	}
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestExcludedGitResourcesAreNotRead(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
@@ -854,7 +632,6 @@ func TestExcludedGitResourcesAreNotRead(t *testing.T) {
 	require.ErrorContains(t, err, "missing from object inventory", "broken reachability must not turn reachable blobs into unreachable ones")
 }
 
-//nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestObjectScanCancellationAndLinks(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q")
@@ -886,8 +663,6 @@ func TestObjectScanCancellationAndLinks(t *testing.T) {
 // A tiny DAG represents more than 100,000 file paths, or over a million empty
 // directories. Neither may be expanded without a bound merely because its
 // unique objects fit in the cache.
-//
-//nolint:exhaustruct // Fixtures specify only relevant fields.
 func TestTreeExpansionBudget(t *testing.T) {
 	for _, empty := range []bool{false, true} {
 		t.Run(fmt.Sprintf("empty=%v", empty), func(t *testing.T) {
@@ -913,37 +688,6 @@ func TestTreeExpansionBudget(t *testing.T) {
 			changes, err := rawTreeChanges(t.Context(), &object.Commit{TreeHash: id}, &treeCache{r: repo})
 			require.ErrorContains(t, err, "expansion budget")
 			require.Empty(t, changes, "an incomplete comparison must not yield partial patches")
-		})
-	}
-}
-
-func TestExpensiveDiffBudget(t *testing.T) {
-	var src, dst strings.Builder
-	// Every line exists in both versions, defeating unmatched-line pruning.
-	// Reverse order also avoids the diff engine's half-match shortcut.
-	for i := range 30000 {
-		fmt.Fprintf(&src, "line %d\n", i)
-		fmt.Fprintf(&dst, "line %d\n", 29999-i)
-	}
-	for _, cancelDuringSearch := range []bool{false, true} {
-		t.Run(fmt.Sprintf("cancel=%v", cancelDuringSearch), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			if cancelDuringSearch {
-				timer := time.AfterFunc(50*time.Millisecond, cancel)
-				defer timer.Stop()
-			}
-			started := time.Now()
-			err := lineAdditions(ctx, src.String(), dst.String(), func(string, int) error {
-				t.Error("timed-out diff yielded approximate additions")
-				return nil
-			})
-			if cancelDuringSearch {
-				require.ErrorIs(t, err, context.Canceled)
-			} else {
-				require.ErrorContains(t, err, "computation budget")
-			}
-			require.Less(t, time.Since(started), 5*time.Second)
 		})
 	}
 }

@@ -151,7 +151,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			return local.Fragments(ctx, yield)
 		})
 	}
-	r, _, cleanup, err := s.open(ctx)
+	r, cleanup, err := s.open(ctx)
 	if err != nil {
 		return err
 	}
@@ -221,7 +221,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	return ctx.Err()
 }
 
-func (s *Source) commits(ctx context.Context, r *git.Repository, history *history, revisit bool, yield sources.FragmentsFunc) error {
+func (s *Source) commits(ctx context.Context, r *git.Repository, walk *history, revisit bool, yield sources.FragmentsFunc) error {
 	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
@@ -248,12 +248,12 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 				select {
 				case <-workCtx.Done():
 					return workCtx.Err()
-				case c, ok := <-jobs:
+				case task, ok := <-jobs:
 					if !ok {
 						return nil
 					}
-					if err := w.commit(workCtx, c.commit, c.resources, yield); err != nil {
-						return fmt.Errorf("commit %s: %w", c.commit.Hash, err)
+					if err := w.commit(workCtx, task.commit, task.resources, yield); err != nil {
+						return fmt.Errorf("commit %s: %w", task.commit.Hash, err)
 					}
 				}
 			}
@@ -261,29 +261,29 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, history *histor
 	}
 	group.Go(func() error {
 		defer close(jobs)
-		for revisit || s.MaxCount == 0 || history.selected < s.MaxCount {
+		for revisit || s.MaxCount == 0 || walk.selected < s.MaxCount {
 			if err := workCtx.Err(); err != nil {
 				return err
 			}
-			c, resources, e := history.next(workCtx)
-			if errors.Is(e, io.EOF) {
+			commit, resources, err := walk.next(workCtx)
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			if e != nil {
-				return e
+			if err != nil {
+				return err
 			}
-			if !accept(c) {
+			if !accept(commit) {
 				continue
 			}
-			if history.seen[c.Hash]&commitSelected == 0 {
-				if s.MaxCount > 0 && history.selected >= s.MaxCount {
+			if walk.seen[commit.Hash]&commitSelected == 0 {
+				if s.MaxCount > 0 && walk.selected >= s.MaxCount {
 					continue
 				}
-				history.selected++
-				history.seen[c.Hash] |= commitSelected
+				walk.selected++
+				walk.seen[commit.Hash] |= commitSelected
 			}
 			select {
-			case jobs <- job{c, resources}:
+			case jobs <- job{commit, resources}:
 			case <-workCtx.Done():
 				return workCtx.Err()
 			}
@@ -302,7 +302,8 @@ func (s *Source) selector() func(*object.Commit) bool {
 	committer, _ := regexp.Compile(s.Committer)
 	return func(c *object.Commit) bool {
 		return !(s.Since != nil && c.Committer.When.Before(*s.Since)) && !(s.Until != nil && c.Committer.When.After(*s.Until)) &&
-			author.MatchString(c.Author.Name+" <"+c.Author.Email+">") && committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">")
+			(s.Author == "" || author.MatchString(c.Author.Name+" <"+c.Author.Email+">")) &&
+			(s.Committer == "" || committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">"))
 	}
 }
 
@@ -365,13 +366,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, resources commitR
 		if w.source.Prefilter != nil && w.source.Prefilter(fileAttrs) {
 			continue
 		}
-		emit := func(raw string, line int) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return yield(sources.Fragment{Raw: raw, StartLine: line, Attributes: fileAttrs}, nil)
-		}
-		if err := w.change(ctx, change, fileAttrs, emit, yield); err != nil {
+		if err := w.change(ctx, change, fileAttrs, yield); err != nil {
 			return fmt.Errorf("path %q: %w", change.To.Name, err)
 		}
 	}

@@ -15,16 +15,16 @@ import (
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
-func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(), error) {
+//nolint:exhaustruct // Unspecified storage options and cache bookkeeping use their zero values.
+func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 	// Reuse upstream discovery for bare repositories, gitdir files and commondir.
 	// No worktree operations or object traversal run against this initial store.
 	discovered, err := git.PlainOpen(s.RepoPath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	initial := discovered.Storer.(*filesystem.Storage)
 	base := initial.Filesystem()
@@ -35,7 +35,7 @@ func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(
 		common.Close()
 		if readErr != nil || len(path) > 4096 {
 			initial.Close()
-			return nil, nil, nil, errors.New("could not read bounded commondir path")
+			return nil, nil, errors.New("could not read bounded commondir path")
 		}
 		objectRoot = strings.TrimSpace(string(path))
 		if !filepath.IsAbs(objectRoot) {
@@ -43,11 +43,11 @@ func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(
 		}
 	} else if !errors.Is(commonErr, os.ErrNotExist) {
 		initial.Close()
-		return nil, nil, nil, commonErr
+		return nil, nil, commonErr
 	}
 	fs := readOnlyFS{Filesystem: base, objectRoot: objectRoot}
 	if err := initial.Close(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	// Shallow scans need explicit boundary semantics; reject instead of claiming
 	// a complete parent comparison when the available parents are incomplete.
@@ -57,13 +57,13 @@ func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(
 		n, readErr := shallow.Read(b[:])
 		shallow.Close()
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, nil, nil, readErr
+			return nil, nil, readErr
 		}
 		if n > 0 {
-			return nil, nil, nil, errors.New("go-git history source does not yet support shallow repositories")
+			return nil, nil, errors.New("go-git history source does not yet support shallow repositories")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	budget := s.CacheMiB
 	if budget == 0 {
@@ -78,18 +78,18 @@ func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(
 		data, readErr := io.ReadAll(io.LimitReader(alternates, 65537))
 		alternates.Close()
 		if readErr != nil {
-			return nil, nil, nil, readErr
+			return nil, nil, readErr
 		}
 		if len(data) > 65536 {
-			return nil, nil, nil, errors.New("Git alternates file exceeds 64 KiB")
+			return nil, nil, errors.New("git alternates file exceeds 64 KiB")
 		}
 		for _, path := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			if path != "" && !filepath.IsAbs(path) {
-				return nil, nil, nil, errors.New("go-git source does not yet support relative object alternates")
+				return nil, nil, errors.New("go-git source does not yet support relative object alternates")
 			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	root := filepath.VolumeName(objectRoot) + string(filepath.Separator)
 	altFS := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
@@ -106,15 +106,15 @@ func (s *Source) open(ctx context.Context) (*git.Repository, *objectCache, func(
 	if err := reader.openPacks(fs); err != nil {
 		reader.closePacks()
 		store.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	r, err := git.Open(reader, nil)
 	if err != nil {
 		reader.closePacks()
 		store.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return r, objects, func() { reader.closePacks(); store.Close() }, nil
+	return r, func() { reader.closePacks(); store.Close() }, nil
 }
 
 // Read-only mappings remove random pack/index read syscalls. Resident mapped
@@ -188,26 +188,4 @@ func (f readOnlyFS) Chroot(path string) (billy.Filesystem, error) {
 		return nil, err
 	}
 	return readOnlyFS{Filesystem: fs, objectRoot: fs.Root()}, nil
-}
-
-// FSObject.Size reports content size, but its reader closure retains a Packfile
-// and scanner buffers. Caching tiny commits this way can turn a 96 MiB cache
-// into gigabytes. Keep materialized objects (including reconstructed delta
-// bases) and let these storage handles go after each read. Their
-// contents would still need decompression on every Reader call, even if cached.
-type objectCache struct{ *cache.ObjectLRU }
-
-func (c *objectCache) Put(obj plumbing.EncodedObject) {
-	if _, lazy := obj.(*packfile.FSObject); lazy {
-		return
-	}
-	if cache.FileSize(obj.Size()) > c.MaxSize {
-		return
-	}
-	// Upstream's LRU calls Hash while holding its global mutex. Hashing a
-	// reconstructed blob can scan megabytes and block every cache lookup.
-	// Materialized objects are private to their decoder until this publication;
-	// compute their memoized hash before entering the cache's critical section.
-	obj.Hash()
-	c.ObjectLRU.Put(obj)
 }

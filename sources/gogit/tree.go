@@ -1,77 +1,13 @@
 package gogit
 
 import (
-	"container/list"
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
-	"sync"
 
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
-
-// Only Entries and Hash are shared. Never call Tree.FindEntry/Tree.Tree on a
-// cached tree: those methods can lazily mutate the tree's internal path cache.
-// 32 MiB includes an estimate for decoded entries, names, and cache overhead.
-type treeCache struct {
-	mu      sync.Mutex
-	entries map[plumbing.Hash]*list.Element
-	lru     list.List
-	bytes   int
-	r       *git.Repository
-}
-type cachedTree struct {
-	id    plumbing.Hash
-	tree  *object.Tree
-	bytes int
-}
-
-func (c *treeCache) get(id plumbing.Hash) (*object.Tree, error) {
-	c.mu.Lock()
-	if e := c.entries[id]; e != nil {
-		c.lru.MoveToFront(e)
-		t := e.Value.(*cachedTree).tree
-		c.mu.Unlock()
-		return t, nil
-	}
-	c.mu.Unlock()
-	t, err := c.r.TreeObject(id)
-	if err != nil {
-		return nil, err
-	}
-	// Count allocated slice capacity, not only its populated entries. Go's
-	// append growth can otherwise undercharge large decoded trees substantially.
-	size := 256 + cap(t.Entries)*int(reflect.TypeFor[object.TreeEntry]().Size())
-	for _, entry := range t.Entries {
-		size += (len(entry.Name) + 15) &^ 15
-	}
-	if size > 8<<20 {
-		return t, nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.entries == nil {
-		c.entries = make(map[plumbing.Hash]*list.Element)
-	}
-	if e := c.entries[id]; e != nil {
-		c.lru.MoveToFront(e)
-		return e.Value.(*cachedTree).tree, nil
-	}
-	c.entries[id] = c.lru.PushFront(&cachedTree{id, t, size})
-	c.bytes += size
-	for c.bytes > 32<<20 {
-		e := c.lru.Back()
-		value := e.Value.(*cachedTree)
-		delete(c.entries, value.id)
-		c.bytes -= value.bytes
-		c.lru.Remove(e)
-	}
-	return t, nil
-}
 
 func treeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (object.Changes, error) {
 	changes, err := rawTreeChanges(ctx, c, cache)

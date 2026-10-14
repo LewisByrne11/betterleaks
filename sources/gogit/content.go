@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,7 +16,13 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]string, emit func(string, int) error, yield sources.FragmentsFunc) error {
+func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]string, yield sources.FragmentsFunc) error {
+	emit := func(raw string, line int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return yield(sources.Fragment{Raw: raw, StartLine: line, Attributes: attrs}, nil)
+	}
 	kindChanged := c.From.Name != "" && uint32(c.From.TreeEntry.Mode)&0170000 != uint32(c.To.TreeEntry.Mode)&0170000
 	if c.From.Name != "" && c.From.TreeEntry.Hash == c.To.TreeEntry.Hash && !kindChanged {
 		return nil
@@ -54,7 +59,7 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 	if binary {
 		return nil
 	}
-	if !cacheable || w.patches == nil {
+	if !cacheable {
 		return w.differ.additions(ctx, src, dst, emit)
 	}
 	var additions []textAddition
@@ -79,17 +84,6 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 	return err
 }
 
-// Lines absent from the other file cannot be matches. Remove them before the
-// quadratic edit search, then map matching destination lines back to their
-// original positions. This matters for generated files with tens of thousands
-// of replaced lines; diffing those unmatched lines wastes almost all CPU time.
-// As with Git's own preprocessing, ambiguous edit boundaries can differ from
-// an unpruned diff. We preserve exact destination contents and line numbers.
-func lineAdditions(ctx context.Context, src, dst string, emit func(string, int) error) error {
-	var d lineDiffer
-	return d.additions(ctx, src, dst, emit)
-}
-
 // Each worker reuses its line bookkeeping, but releases unusually large diffs
 // and clears dictionary keys so scratch space never keeps old blobs alive.
 type lineDiffer struct {
@@ -106,6 +100,12 @@ func resize[T any](s []T, n int) []T {
 	return s[:n]
 }
 
+// Lines absent from the other file cannot be matches. Remove them before the
+// quadratic edit search, then map matching destination lines back to their
+// original positions. This matters for generated files with tens of thousands
+// of replaced lines; diffing those unmatched lines wastes almost all CPU time.
+// As with Git's own preprocessing, ambiguous edit boundaries can differ from
+// an unpruned diff. We preserve exact destination contents and line numbers.
 func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(string, int) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -305,18 +305,6 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 		return "", false, fmt.Errorf("blob %s size %d exceeds diff input limit %d", e.TreeEntry.Hash, obj.Size(), w.maxBlob)
 	}
 	return obj.raw, strings.IndexByte(obj.raw[:min(len(obj.raw), 8000)], 0) >= 0, nil
-}
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r contextReader) Read(b []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.r.Read(b)
 }
 
 func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[string]string, yield sources.FragmentsFunc) error {
