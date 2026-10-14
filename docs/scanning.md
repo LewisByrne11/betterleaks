@@ -265,7 +265,7 @@ CLI JSON reports contain `schema_version`, `findings`, and `scan`:
 ```
 
 `state` is `complete` when scanning finishes normally, even when findings or
-recoverable warnings (such as filesystem archive warnings or permission-denied
+recoverable warnings (such as filesystem/Git archive warnings or permission-denied
 skips) are reported. It is `incomplete` when cancellation or a source or detection
 error prevents full coverage, including failures before any findings are emitted.
 Container scans treat unreadable or corrupt nested archives as coverage errors,
@@ -746,6 +746,10 @@ without an earlier deadline.
 Each tree comparison permits at most 1,000,000 visited entries, 100,000 changes,
 and 16 MiB of expanded path bytes. Exceeding these limits reports incomplete
 coverage, including for small tree DAGs that expand into very many paths.
+
+Unreadable or corrupt archive contents produce warnings and scanning continues,
+as with filesystem scans. Archive warnings alone do not mark a Git scan incomplete;
+repository-read failures and diff-limit errors still do.
 
 Supported fetch remotes generate SCM URLs from local configuration. Use
 `--platform=github` or `--platform=gitlab` for self-hosted services, or

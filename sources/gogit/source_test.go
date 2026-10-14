@@ -4,10 +4,12 @@ package gogit
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -256,12 +258,32 @@ func TestSelectionAndArchives(t *testing.T) {
 	require.NoError(t, err)
 	_, err = inner.Write([]byte("TOKEN_ARCHIVE\n"))
 	require.NoError(t, err)
+	// A malformed nested archive must not discard readable siblings or fail
+	// the Git scan. GitLab's registry fixture contains this empty-ZIP case.
+	_, err = writer.Create("empty.zip")
+	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 	require.NoError(t, zipFile.Close())
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, err = gz.Write([]byte("TOKEN_GZIP\n"))
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	data := compressed.Bytes()
+	data[len(data)-8] ^= 0xff // corrupt CRC, keeping the contents readable
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "corrupt.gz"), data, 0600))
 	gitFixture(t, repo, "add", ".")
 	gitFixture(t, repo, "commit", "-qm", "archive")
-	fs := collect(t, &Source{RepoPath: repo, MaxCount: 1, MaxArchiveDepth: 1})
-	require.Equal(t, map[string]string{"TOKEN_ARCHIVE\n": "archive.zip!secret.txt:1"}, textOccurrences(fs))
+	var warnings bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&warnings, nil))
+	fs := collect(t, &Source{RepoPath: repo, MaxCount: 1, MaxArchiveDepth: 2, Logger: logger})
+	require.Equal(t, map[string]string{
+		"TOKEN_ARCHIVE\n": "archive.zip!secret.txt:1",
+		"TOKEN_GZIP\n":    "corrupt.gz:1",
+	}, textOccurrences(fs))
+	require.Contains(t, warnings.String(), "level=WARN")
+	require.Contains(t, warnings.String(), "archive.zip!empty.zip")
+	require.Contains(t, warnings.String(), "gzip: invalid checksum")
 }
 
 func TestSHA256(t *testing.T) {

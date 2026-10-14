@@ -330,6 +330,7 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 		return err
 	}
 	defer r.Close()
-	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: true}
+	// Match filesystem scans: damaged archives warn without failing history traversal.
+	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: false}
 	return source.Fragments(ctx, yield)
 }
