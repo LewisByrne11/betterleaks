@@ -142,7 +142,7 @@ Multiple local paths are supported, but a remote scan accepts one target and
 cannot be mixed with local paths.
 
 GitHub and Hugging Face repository URLs and HTTP(S) paths ending in `.git`
-select a temporary Git mirror and a history scan. Recognized provider owners,
+select a temporary Git clone and a history scan. Recognized provider owners,
 organizations, buckets, and supported resource URLs select their existing
 provider sources. GitLab project/group ambiguity and other HTTP(S) URLs use
 Git smart HTTP discovery: a five-second request, at most three redirects, and
@@ -564,9 +564,17 @@ The Git source reads repository objects in-process with go-git. It never runs
 `git`, hooks, diff or textconv helpers, filters, SSH, or credential helpers, so
 scanning an untrusted repository cannot execute anything it configures.
 
-By default it scans the history reachable from HEAD and every ref. Each commit is
-compared with its first parent and only added lines are scanned; both parents of
-a merge are walked.
+By default it scans the history reachable from HEAD and every local ref. Each
+commit is compared with its first parent and only added lines are scanned; both
+parents of a merge are walked.
+
+HTTP(S) URL scans fetch branches (`refs/heads/*`), tags (`refs/tags/*`), and notes
+(`refs/notes/*`). This also applies to Git history fetched by the `github`,
+`gitlab`, and `huggingface` sources. Hosting services also publish refs for pull
+requests, merge requests, and other code reviews, such as `refs/pull/*`,
+`refs/merge-requests/*`, `refs/changes/*`, and `refs/pr/*`. These refs are excluded,
+so history reachable only through them is not downloaded or scanned. Notes are
+scanned when `--include=notes` is selected.
 
 ```sh
 betterleaks git .                                # all history
@@ -574,6 +582,14 @@ betterleaks git . --revision=origin/main..HEAD   # commits not yet on origin/mai
 betterleaks git . --include=commit-messages,notes
 betterleaks git . --since=2026-01-01 --author='Example <'
 betterleaks git https://github.com/owner/repo
+```
+
+To also scan pull-request and merge-request history, create a mirror yourself
+and scan it locally. To scan just one PR, see [Scanning a pull request](#scanning-a-pull-request).
+
+```sh
+git clone --mirror https://github.com/owner/repo repo.git
+betterleaks git repo.git
 ```
 
 ### What to scan
@@ -614,7 +630,8 @@ content counts as unreachable. `objects` includes the unreachable blobs.
 
 - `--revision=REV` starts at one revision. `--revision=A..B` scans the commits
   reachable from B but not from A, and `A..` means `A..HEAD`. `A...B` is not
-  supported.
+  supported. This selects commits from available history; it does not fetch
+  additional refs.
 - `--since` and `--until` filter by committer time, in RFC3339 or `YYYY-MM-DD`
   (UTC). A date-only `--until` includes that whole day. Filtering never prunes the
   walk, so backdated commits are still found.
@@ -632,6 +649,31 @@ content counts as unreachable. `objects` includes the unreachable blobs.
 Notes and tag and reflog messages aren't restricted by `--revision`. Date,
 identity, and count filters apply to note commits but not to tag or reflog
 messages.
+
+### Scanning a pull request
+
+For a PR whose source branch exists in the target repository, a URL scan can
+select its commits directly. For example, to scan commits on `feature-branch`
+that are not reachable from `main`:
+
+```sh
+betterleaks git https://github.com/owner/repo --revision=main..feature-branch
+```
+
+For a GitHub PR from a fork, fetch that specific PR into a local clone first.
+Run these commands in a clone whose `origin` points to the target repository,
+replacing `main` with the PR's base branch and `123` with its number:
+
+```sh
+git fetch origin main
+git fetch origin refs/pull/123/head:refs/heads/pr-123
+betterleaks git . --revision=origin/main..pr-123
+```
+
+Passing `--revision=refs/pull/123/head` to a URL scan does not fetch that PR ref
+and fails because it is unavailable. The local fetch above explicitly includes
+one PR without downloading every PR's history. This also works for a GitHub PR
+whose source branch has been deleted, provided its PR ref is still available.
 
 ### Finding metadata
 
@@ -690,8 +732,8 @@ scan instead of blocking it.
 
 ### Remote repositories
 
-HTTP(S) repositories are fetched in Go into a temporary mirror, with no checkout
-or submodules, and removed after scanning. `--token` supplies HTTPS basic
+HTTP(S) repositories are fetched in Go into a temporary bare repository, with no
+checkout or submodules, and removed after scanning. `--token` supplies HTTPS basic
 authentication; for github.com, gitlab.com, and huggingface.co the token can also
 come from `GITHUB_TOKEN`, `GITLAB_TOKEN`, or `HUGGINGFACE_TOKEN`/`HF_TOKEN`.
 Tokens are never inferred for other hosts. URLs with credentials, queries, or

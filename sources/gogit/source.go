@@ -1,6 +1,6 @@
 // Package gogit scans committed additions using go-git's object reader.
 // It never invokes Git, hooks, filters, or diff helpers. URL scans fetch an
-// HTTP(S) mirror; local repository scans do not use a network transport.
+// HTTP(S) clone; local repository scans do not use a network transport.
 // Every bound on work per object, diff, and commit is defined in limits.go.
 package gogit
 
@@ -37,7 +37,8 @@ import (
 // Source can be scanned concurrently.
 type Source struct {
 	RepoPath string
-	// URL scans a temporary HTTP(S) mirror. Mutually exclusive with RepoPath.
+	// URL fetches branches, tags and notes into a temporary bare repository over
+	// HTTP(S), excluding host review refs. Mutually exclusive with RepoPath.
 	URL, Token string
 	// Revision starts history at one revision, or selects a range "A..B": the
 	// commits reachable from B but not from A. Empty scans HEAD and every ref.

@@ -121,6 +121,16 @@ Git history is read in-process; Betterleaks no longer runs `git`.
 - For staged or unstaged changes, pre-receive hooks, or any other Git selection,
   pipe a patch into `stdin --git-diff`. See [Git scanning](scanning.md#git).
 
+Remote Git scans now fetch only branches, tags, and notes. This applies to `git`
+HTTP(S) URLs and Git history fetched by `github`, `gitlab`, and `huggingface`.
+Earlier versions mirrored every advertised ref, including pull requests and
+other host review refs. Findings reachable only through those refs no longer
+appear in remote scans. To retain that scope, run `git clone --mirror URL repo.git`
+and scan it with `betterleaks git repo.git`.
+`--revision` selects available history and does not fetch excluded refs. To scan
+a single PR from a fork, fetch that PR into a local clone first; see
+[Scanning a pull request](scanning.md#scanning-a-pull-request).
+
 The default scans history only. `--include` adds resources and `--exclude`
 removes them: `--include=commit-messages,notes` adds messages and notes,
 `--include=unreachable-objects` adds abandoned or uncommitted blobs, and
