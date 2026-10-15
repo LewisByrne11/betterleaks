@@ -564,9 +564,9 @@ The Git source reads repository objects in-process with go-git. It never runs
 `git`, hooks, diff or textconv helpers, filters, SSH, or credential helpers, so
 scanning an untrusted repository cannot execute anything it configures.
 
-By default it scans the history reachable from HEAD and every local ref. Each
-commit is compared with its first parent and only added lines are scanned; both
-parents of a merge are walked.
+By default it scans the history reachable from HEAD and every ref in the
+repository. Each commit is compared with its first parent and only added lines
+are scanned; both parents of a merge are walked.
 
 HTTP(S) URL scans fetch branches (`refs/heads/*`), tags (`refs/tags/*`), and notes
 (`refs/notes/*`). This also applies to Git history fetched by the `github`,

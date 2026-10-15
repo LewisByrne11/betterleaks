@@ -907,7 +907,7 @@ func (s *Source) scanProjectGit(ctx context.Context, proj *gitlabProject, yield 
 	if proj.HTTPURLToRepo == "" {
 		return nil
 	}
-	return scm.CloneToTempDir(ctx, proj.HTTPURLToRepo, s.Token, "betterleaks-gitlab-*", scm.CloneOptions{Mirror: true}, func(repoPath string) error {
+	return scm.CloneToTempDir(ctx, proj.HTTPURLToRepo, s.Token, "betterleaks-gitlab-*", func(repoPath string) error {
 		src := &gogit.Source{
 			Logger:   s.Logger,
 			RepoPath: repoPath, Prefilter: s.Prefilter,

@@ -84,9 +84,8 @@ func TestCloneTransportBoundary(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-	opts := CloneOptions{Mirror: true}
 	for _, remote := range []string{"ssh://git@example.test/repo", "file:///tmp/repo", "git@example.test:repo", server.URL + "/repo?token=secret", server.URL + "/repo?", "http://user:secret@" + strings.TrimPrefix(server.URL, "http://") + "/repo"} {
-		err := CloneAuthed(t.Context(), remote, "", filepath.Join(t.TempDir(), "repo"), opts)
+		err := CloneAuthed(t.Context(), remote, "", filepath.Join(t.TempDir(), "repo"))
 		if err == nil || !strings.Contains(err.Error(), "HTTP(S) URL") {
 			t.Fatalf("unexpected URL validation result for %q: %v", remote, err)
 		}
@@ -94,13 +93,13 @@ func TestCloneTransportBoundary(t *testing.T) {
 			t.Fatalf("URL credentials leaked: %v", err)
 		}
 	}
-	if err := CloneAuthed(t.Context(), server.URL+"/repo", "secret", filepath.Join(t.TempDir(), "repo"), opts); err == nil || !strings.Contains(err.Error(), "require HTTPS") {
+	if err := CloneAuthed(t.Context(), server.URL+"/repo", "secret", filepath.Join(t.TempDir(), "repo")); err == nil || !strings.Contains(err.Error(), "require HTTPS") {
 		t.Fatalf("expected insecure token rejection, got %v", err)
 	}
 	if requests.Load() != 0 {
 		t.Fatal("rejected clone made a network request")
 	}
-	if err := CloneAuthed(t.Context(), server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo"), opts); err == nil {
+	if err := CloneAuthed(t.Context(), server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo")); err == nil {
 		t.Fatal("expected missing repository error")
 	}
 	if requests.Load() == 0 {
@@ -108,7 +107,7 @@ func TestCloneTransportBoundary(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err := CloneAuthed(ctx, server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo"), opts)
+	err := CloneAuthed(ctx, server.URL+"/repo", "", filepath.Join(t.TempDir(), "repo"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancellation, got %v", err)
 	}
@@ -154,8 +153,7 @@ func TestCloneRedirectCredentials(t *testing.T) {
 			previous := http.DefaultTransport
 			http.DefaultTransport = origin.Client().Transport
 			t.Cleanup(func() { http.DefaultTransport = previous })
-			opts := CloneOptions{Mirror: true}
-			err := CloneAuthed(t.Context(), origin.URL+"/repo", "TEST_TOKEN", filepath.Join(t.TempDir(), "repo"), opts)
+			err := CloneAuthed(t.Context(), origin.URL+"/repo", "TEST_TOKEN", filepath.Join(t.TempDir(), "repo"))
 			if err == nil || strings.Contains(err.Error(), "TEST_TOKEN") {
 				t.Fatalf("expected sanitized clone failure: %v", err)
 			}
@@ -239,7 +237,7 @@ func TestClonePublishedRefs(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "clone")
-	require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{Mirror: true}))
+	require.NoError(t, CloneAuthed(t.Context(), remote, "", dest))
 	repo, err := git.PlainOpen(dest)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, repo.Close()) })
@@ -284,7 +282,7 @@ func TestClonePublishedRefsWithoutBranches(t *testing.T) {
 				}
 			}
 			dest := filepath.Join(t.TempDir(), "clone")
-			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{Mirror: true}))
+			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest))
 			repo, err := git.PlainOpen(dest)
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, repo.Close()) })

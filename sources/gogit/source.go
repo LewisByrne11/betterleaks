@@ -191,10 +191,14 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 		return err
 	}
 	if s.URL != "" {
-		return scm.CloneToTempDir(ctx, s.URL, s.Token, "betterleaks-git-*", scm.CloneOptions{Mirror: true, Bare: false, SingleBranch: false, Depth: 0}, func(path string) error {
+		return scm.CloneToTempDir(ctx, s.URL, s.Token, "betterleaks-git-*", func(path string) error {
 			local := *s
 			local.RepoPath, local.URL, local.Token = path, "", ""
-			return local.Fragments(ctx, yield)
+			err := local.Fragments(ctx, yield)
+			if s.Revision != "" && errors.Is(err, plumbing.ErrReferenceNotFound) {
+				return fmt.Errorf("%w; URL scans fetch only branches, tags and notes", err)
+			}
+			return err
 		})
 	}
 	r, cleanup, err := s.open(ctx)

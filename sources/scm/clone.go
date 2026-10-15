@@ -18,19 +18,11 @@ import (
 	"github.com/go-git/go-git/v6/storage/filesystem"
 )
 
-// CloneOptions selects the refs to fetch.
-type CloneOptions struct {
-	Bare bool
-	// Mirror copies branches, tags and notes to their original names in a bare
-	// repository. Host-specific refs, including pull requests, are excluded.
-	Mirror       bool
-	SingleBranch bool
-	Depth        int
-}
-
-// CloneAuthed fetches HTTP(S) Git objects directly in Go. It does not check out
-// files, run credential helpers, recurse into submodules, or execute Git/SSH.
-func CloneAuthed(ctx context.Context, remote, token, dest string, opts CloneOptions) error {
+// CloneAuthed fetches the branches, tags and notes of an HTTP(S) repository
+// into a bare repository at dest, directly in Go. Host review refs such as
+// refs/pull are excluded. It does not check out files, run credential helpers,
+// recurse into submodules, or execute Git/SSH.
+func CloneAuthed(ctx context.Context, remote, token, dest string) error {
 	u, err := url.Parse(remote)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return errors.New("git clone requires an HTTP(S) URL without credentials, query or fragment; use Token for authentication")
@@ -45,21 +37,7 @@ func CloneAuthed(ctx context.Context, remote, token, dest string, opts CloneOpti
 	if token != "" {
 		auth = []client.Option{client.WithHTTPAuth(&githttp.BasicAuth{Username: "x-access-token", Password: token})}
 	}
-	if opts.Mirror {
-		err = fetchPublishedRefs(ctx, remote, dest, auth, opts.Depth)
-	} else {
-		options := new(git.CloneOptions)
-		options.URL, options.Bare = remote, opts.Bare
-		options.NoCheckout, options.AllowEmptyRepo = true, true
-		options.SingleBranch, options.Depth = opts.SingleBranch, opts.Depth
-		options.ClientOptions = auth
-		var repo *git.Repository
-		repo, err = git.PlainCloneContext(ctx, dest, options)
-		if repo != nil {
-			defer repo.Storer.(*filesystem.Storage).Close()
-		}
-	}
-	if err != nil {
+	if err := fetchPublishedRefs(ctx, remote, dest, auth); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -70,7 +48,7 @@ func CloneAuthed(ctx context.Context, remote, token, dest string, opts CloneOpti
 
 // fetchPublishedRefs keeps review-only history out of the download, rather than
 // discarding its refs after fetching all of their objects.
-func fetchPublishedRefs(ctx context.Context, remote, dest string, auth []client.Option, depth int) error {
+func fetchPublishedRefs(ctx context.Context, remote, dest string, auth []client.Option) error {
 	repo, err := git.PlainInit(dest, true)
 	if err != nil {
 		return err
@@ -88,7 +66,7 @@ func fetchPublishedRefs(ctx context.Context, remote, dest string, auth []client.
 	if err != nil {
 		return err
 	}
-	err = origin.FetchContext(ctx, &git.FetchOptions{RefSpecs: refs, ClientOptions: auth, Tags: plumbing.NoTags, Depth: depth})
+	err = origin.FetchContext(ctx, &git.FetchOptions{RefSpecs: refs, ClientOptions: auth, Tags: plumbing.NoTags})
 	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
 		// A remote containing only excluded refs is empty for this scan.
 		return nil
@@ -125,7 +103,7 @@ func fetchPublishedRefs(ctx context.Context, remote, dest string, auth []client.
 
 // CloneToTempDir clones a remote into a temporary directory, invokes fn with
 // the cloned repo path, and removes the directory afterwards.
-func CloneToTempDir(ctx context.Context, remote, token, tempDirPattern string, opts CloneOptions, fn func(repoPath string) error) error {
+func CloneToTempDir(ctx context.Context, remote, token, tempDirPattern string, fn func(repoPath string) error) error {
 	if tempDirPattern == "" {
 		tempDirPattern = "betterleaks-git-*"
 	}
@@ -135,7 +113,7 @@ func CloneToTempDir(ctx context.Context, remote, token, tempDirPattern string, o
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := CloneAuthed(ctx, remote, token, tmpDir, opts); err != nil {
+	if err := CloneAuthed(ctx, remote, token, tmpDir); err != nil {
 		return err
 	}
 	return fn(tmpDir)
