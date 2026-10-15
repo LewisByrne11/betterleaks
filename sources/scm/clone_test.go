@@ -209,6 +209,20 @@ func cloneTestRemote(t *testing.T, tlsHTTP2 bool) (string, func(string, ...strin
 	return server.URL + "/repo.git", run
 }
 
+func TestCloneRequiresEmptyDestination(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	dest := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dest, "HEAD"), []byte("ref: refs/pull/1/head\n"), 0o600))
+	err := CloneAuthed(t.Context(), server.URL+"/repo", "", dest)
+	require.ErrorContains(t, err, "not empty")
+	require.Zero(t, requests.Load(), "a rejected destination must not reach the network")
+}
+
 // Hosts such as GitHub accept HTTP/2 when a client offers it. The clone client
 // speaks only HTTP/1.1, so it must not offer h2 during the TLS handshake.
 func TestCloneFromHTTP2Server(t *testing.T) {

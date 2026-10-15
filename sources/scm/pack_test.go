@@ -2,6 +2,7 @@
 package scm
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"context"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -233,6 +235,24 @@ func TestIndexPackRejectsCorruptionAndLimits(t *testing.T) {
 			}
 			require.Empty(t, idx.Bytes(), "an invalid pack must not produce an index")
 		})
+	}
+}
+
+// A resolver reuses its chain across trees, so finished links must not keep
+// their content reachable through the slice's backing array.
+func TestResolverReleasesFinishedChains(t *testing.T) {
+	data := mixedTestPack(t, format.SHA1)
+	table, err := scanPack(t.Context(), bytes.NewReader(data), format.SHA1, fetchPackLimits())
+	require.NoError(t, err)
+	r := &resolver{ctx: t.Context(), f: bytes.NewReader(data), t: table, limits: fetchPackLimits(),
+		cacheBytes: fetchPackLimits().cacheBytes, refs: new(sync.Mutex), hasRefs: len(table.refChildren) > 0,
+		input: bufio.NewReaderSize(nil, 8192)}
+	for i := range table.objects {
+		require.NoError(t, r.tree(i))
+	}
+	require.Positive(t, cap(r.chain))
+	for _, link := range r.chain[:cap(r.chain)] {
+		require.Empty(t, link.content)
 	}
 }
 

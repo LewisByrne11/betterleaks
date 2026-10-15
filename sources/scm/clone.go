@@ -32,6 +32,13 @@ func CloneAuthed(ctx context.Context, remote, token, dest string) error {
 	if dest == "" {
 		return errors.New("git clone destination is empty")
 	}
+	// Like git clone, never mix a clone with existing content: the scan walks
+	// every ref it finds there, including ones this fetch would exclude.
+	if entries, err := os.ReadDir(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("git clone destination: %w", err)
+	} else if len(entries) > 0 {
+		return errors.New("git clone destination is not empty")
+	}
 	if token != "" && u.Scheme != "https" {
 		return errors.New("git clone tokens require HTTPS")
 	}

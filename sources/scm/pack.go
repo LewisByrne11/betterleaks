@@ -199,13 +199,6 @@ func (w *packWriter) Close() (err error) {
 	if err := w.file.Close(); err != nil {
 		return err
 	}
-	// Resolving reads delta records all over the pack. A read-only mapping
-	// avoids a system call per record where the platform supports it.
-	pack, err := osfs.New(w.dir, osfs.WithMmap()).Open("pack")
-	if err != nil {
-		return err
-	}
-	defer pack.Close()
 	idxPath := filepath.Join(w.dir, "index")
 	out, err := os.Create(idxPath)
 	if err != nil {
@@ -217,8 +210,14 @@ func (w *packWriter) Close() (err error) {
 		out.Close()
 		return err
 	}
-	err = indexTable(w.s.ctx, pack, w.table, w.s.limits, out, rev)
-	err = errors.Join(err, out.Close(), rev.Close(), pack.Close())
+	// Resolving reads delta records all over the pack. A read-only mapping
+	// avoids a system call per record where the platform supports it.
+	pack, err := osfs.New(w.dir, osfs.WithMmap()).Open("pack")
+	if err == nil {
+		err = indexTable(w.s.ctx, pack, w.table, w.s.limits, out, rev)
+		err = errors.Join(err, pack.Close())
+	}
+	err = errors.Join(err, out.Close(), rev.Close())
 	if err != nil {
 		return fmt.Errorf("index fetched pack: %w", err)
 	}
@@ -787,6 +786,9 @@ func (r *resolver) tree(i int) error {
 	}
 	r.chain, r.kept = append(r.chain[:0], chainLink{i, content, true}), int64(len(content))
 	err = r.visit(0)
+	// Clear the slots, not just the length: the backing array would otherwise
+	// keep the contents alive outside the cache budget.
+	clear(r.chain)
 	r.chain, r.kept = r.chain[:0], 0
 	return err
 }
@@ -824,6 +826,7 @@ func (r *resolver) visit(level int) error {
 		if r.chain[level+1].kept {
 			r.kept -= int64(len(r.chain[level+1].content))
 		}
+		r.chain[level+1] = chainLink{}
 		r.chain = r.chain[:level+1]
 		if err != nil {
 			return err
