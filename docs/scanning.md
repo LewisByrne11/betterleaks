@@ -740,6 +740,17 @@ Tokens are never inferred for other hosts. URLs with credentials, queries, or
 fragments are rejected, and SSH is not supported. The GitHub, GitLab, and Hugging
 Face sources clone and scan repositories the same way.
 
+Fetched packs are indexed as they download, without limiting pack size,
+object count, or object size: plain objects of any size are streamed. Objects
+stored as deltas are then rebuilt in parallel, one delta chain per worker,
+keeping up to 1 GiB of chains in memory and rebuilding older links when needed.
+Index metadata grows with the object count, about 52 bytes per object. The only packs refused are ones Git does not write by
+default: delta chains longer than 4,096 links (Git writes at most 4,095), and
+delta bases or results over 4 GiB (Git deltifies only objects under
+`core.bigFileThreshold`, 512 MiB by default). A corrupt pack or cancellation
+aborts the fetch and removes its temporary files. `--git-max-blob-mib` applies
+to scanning, not fetching.
+
 ### SDK
 
 ```go

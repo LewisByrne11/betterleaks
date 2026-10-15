@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/betterleaks/betterleaks/v2/internal/urlredact"
@@ -33,11 +35,11 @@ func CloneAuthed(ctx context.Context, remote, token, dest string) error {
 	if token != "" && u.Scheme != "https" {
 		return errors.New("git clone tokens require HTTPS")
 	}
-	var auth []client.Option
+	options := cloneHTTPClient()
 	if token != "" {
-		auth = []client.Option{client.WithHTTPAuth(&githttp.BasicAuth{Username: "x-access-token", Password: token})}
+		options = append(options, client.WithHTTPAuth(&githttp.BasicAuth{Username: "x-access-token", Password: token}))
 	}
-	if err := fetchPublishedRefs(ctx, remote, dest, auth); err != nil {
+	if err := fetchPublishedRefs(ctx, remote, dest, options); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -46,27 +48,55 @@ func CloneAuthed(ctx context.Context, remote, token, dest string) error {
 	return nil
 }
 
+// cloneHTTPClient is go-git's default client limited to HTTP/1.1. A pack arrives
+// as one long response, which HTTP/2 cannot multiplex, and Go's HTTP/2 client
+// was slower at it: downloading kubernetes from GitHub took 35 s with the
+// default stream window and 27 s with a 64 MiB one, against 23 s over HTTP/1.1.
+// go-git still applies its redirect and credential policy to this client.
+//
+//nolint:exhaustruct // Unset client fields keep net/http's defaults.
+func cloneHTTPClient() []client.Option {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	tr := base.Clone()
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetHTTP1(true)
+	// Clone copies the TLS config after setting up HTTP/2 on the original, so it
+	// would still offer h2 to the server, which would then expect HTTP/2.
+	if tr.TLSClientConfig != nil {
+		tr.TLSClientConfig.NextProtos = nil
+	}
+	return []client.Option{client.WithHTTPClient(&http.Client{Transport: tr})}
+}
+
 // fetchPublishedRefs keeps review-only history out of the download, rather than
 // discarding its refs after fetching all of their objects.
-func fetchPublishedRefs(ctx context.Context, remote, dest string, auth []client.Option) error {
+//
+//nolint:exhaustruct // Unset go-git options keep their defaults.
+func fetchPublishedRefs(ctx context.Context, remote, dest string, options []client.Option) error {
 	repo, err := git.PlainInit(dest, true)
 	if err != nil {
 		return err
 	}
-	defer repo.Storer.(*filesystem.Storage).Close()
+	storage := &packStorage{Storage: repo.Storer.(*filesystem.Storage), ctx: ctx,
+		dir: filepath.Join(dest, "objects", "pack"), limits: fetchPackLimits()}
+	repo.Storer = storage
+	defer storage.Close()
 	refs := []config.RefSpec{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "+refs/notes/*:refs/notes/*"}
 	origin, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{remote}, Fetch: refs})
 	if err != nil {
 		return err
 	}
-	advertised, err := origin.ListContext(ctx, &git.ListOptions{ClientOptions: auth})
+	advertised, err := origin.ListContext(ctx, &git.ListOptions{ClientOptions: options})
 	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	err = origin.FetchContext(ctx, &git.FetchOptions{RefSpecs: refs, ClientOptions: auth, Tags: plumbing.NoTags})
+	err = origin.FetchContext(ctx, &git.FetchOptions{RefSpecs: refs, ClientOptions: options, Tags: plumbing.NoTags})
 	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
 		// A remote containing only excluded refs is empty for this scan.
 		return nil

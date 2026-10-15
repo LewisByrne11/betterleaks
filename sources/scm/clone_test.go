@@ -171,7 +171,9 @@ func TestCloneRedirectCredentials(t *testing.T) {
 }
 
 // Git serves the fixture; the clone under test still uses go-git's HTTP transport.
-func cloneTestRemote(t *testing.T) (string, func(string, ...string) string) {
+//
+//nolint:exhaustruct // The fixture server's unset CGI fields keep their defaults.
+func cloneTestRemote(t *testing.T, tlsHTTP2 bool) (string, func(string, ...string) string) {
 	t.Helper()
 	binary, err := exec.LookPath("git")
 	if err != nil {
@@ -192,14 +194,39 @@ func cloneTestRemote(t *testing.T) (string, func(string, ...string) string) {
 		return strings.TrimSpace(string(out))
 	}
 	run("", "init", "--bare", "--initial-branch=trunk")
-	server := httptest.NewServer(&cgi.Handler{Path: binary, Args: []string{"http-backend"},
+	server := httptest.NewUnstartedServer(&cgi.Handler{Path: binary, Args: []string{"http-backend"},
 		Env: []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_CONFIG_NOSYSTEM=1"}})
+	if tlsHTTP2 {
+		server.EnableHTTP2 = true
+		server.StartTLS()
+		previous := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		t.Cleanup(func() { http.DefaultTransport = previous })
+	} else {
+		server.Start()
+	}
 	t.Cleanup(server.Close)
 	return server.URL + "/repo.git", run
 }
 
+// Hosts such as GitHub accept HTTP/2 when a client offers it. The clone client
+// speaks only HTTP/1.1, so it must not offer h2 during the TLS handshake.
+func TestCloneFromHTTP2Server(t *testing.T) {
+	remote, run := cloneTestRemote(t, true)
+	tree := run("", "mktree")
+	commit := run("", "commit-tree", tree, "-m", "root")
+	run("", "update-ref", "refs/heads/trunk", commit)
+	dest := filepath.Join(t.TempDir(), "clone")
+	require.NoError(t, CloneAuthed(t.Context(), remote, "", dest))
+	repo, err := git.PlainOpen(dest)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, repo.Close()) })
+	_, err = repo.CommitObject(plumbing.NewHash(commit))
+	require.NoError(t, err)
+}
+
 func TestClonePublishedRefs(t *testing.T) {
-	remote, run := cloneTestRemote(t)
+	remote, run := cloneTestRemote(t, false)
 	commit := func(name, parent string) (plumbing.Hash, plumbing.Hash) {
 		blob := run(name+"\n", "hash-object", "-w", "--stdin")
 		tree := run("100644 blob "+blob+"\tcontent.txt\n", "mktree")
@@ -267,7 +294,7 @@ func TestClonePublishedRefs(t *testing.T) {
 func TestClonePublishedRefsWithoutBranches(t *testing.T) {
 	for _, kind := range []string{"empty", "tag-only", "review-only", "detached-published", "detached-review"} {
 		t.Run(kind, func(t *testing.T) {
-			remote, run := cloneTestRemote(t)
+			remote, run := cloneTestRemote(t, false)
 			var id plumbing.Hash
 			if kind != "empty" {
 				tree := run("", "mktree")

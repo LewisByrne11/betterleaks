@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/internal/logging"
+	"github.com/betterleaks/betterleaks/v2/internal/urlredact"
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
 	git "github.com/go-git/go-git/v6"
@@ -191,7 +193,10 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 		return err
 	}
 	if s.URL != "" {
+		logger, start := logging.OrDiscard(s.Logger), time.Now()
+		logger.Info("starting clone", "url", urlredact.PublicString(s.URL))
 		return scm.CloneToTempDir(ctx, s.URL, s.Token, "betterleaks-git-*", func(path string) error {
+			logger.Info("clone complete, starting scan", "duration", time.Since(start).Round(time.Millisecond))
 			local := *s
 			local.RepoPath, local.URL, local.Token = path, "", ""
 			err := local.Fragments(ctx, yield)
