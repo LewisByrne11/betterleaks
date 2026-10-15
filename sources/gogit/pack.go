@@ -105,12 +105,14 @@ type packInflater struct {
 var packInflaters = sync.Pool{New: func() any { return &packInflater{input: bufio.NewReaderSize(nil, 8192)} }}
 
 // readPacked reconstructs a packed object. It walks the delta chain down to a
-// cached or undeltified base, then applies the deltas back up. Chain depth
-// costs memory for the delta instructions only, never stack frames.
+// cached or undeltified base reading only record headers, then inflates and
+// applies one delta at a time back up. Chain depth costs one position per
+// link, never stack frames or retained delta instructions.
 func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash) (*storedObject, error) {
 	type link struct {
-		id    plumbing.Hash
-		delta string
+		id     plumbing.Hash
+		pack   *objectPack
+		offset int64
 	}
 	var chain []link
 	var base *storedObject
@@ -126,7 +128,7 @@ func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash
 			base = o
 			break
 		}
-		e, err := s.inflate(p, offset)
+		e, err := s.inflate(p, offset, false)
 		if err != nil {
 			return nil, fmt.Errorf("pack object %s: %w", id, err)
 		}
@@ -138,7 +140,7 @@ func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash
 		if len(chain) == maxDeltaChain {
 			return nil, fmt.Errorf("git delta chain for %s exceeds %d links", chain[0].id, maxDeltaChain)
 		}
-		chain = append(chain, link{id, e.raw})
+		chain = append(chain, link{id, p, offset})
 		if e.kind == plumbing.OFSDeltaObject {
 			offset = e.baseOffset
 			if id, err = p.index.FindHash(offset); err != nil {
@@ -160,11 +162,16 @@ func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash
 		p, offset = next, nextOffset
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
-		raw, err := applyDelta(s.ctx, base.raw, chain[i].delta, s.limit)
+		l := chain[i]
+		e, err := s.inflate(l.pack, l.offset, true)
 		if err != nil {
-			return nil, fmt.Errorf("delta %s: %w", chain[i].id, err)
+			return nil, fmt.Errorf("pack object %s: %w", l.id, err)
 		}
-		base = &storedObject{id: chain[i].id, kind: base.kind, raw: raw}
+		raw, err := applyDelta(s.ctx, base.raw, e.raw, s.limit)
+		if err != nil {
+			return nil, fmt.Errorf("delta %s: %w", l.id, err)
+		}
+		base = &storedObject{id: l.id, kind: base.kind, raw: raw}
 		s.keep(base)
 	}
 	return base, nil
@@ -179,7 +186,9 @@ type packEntry struct {
 	raw        string
 }
 
-func (s *objectStorage) inflate(p *objectPack, offset int64) (packEntry, error) {
+// inflate reads the record at offset. A delta's instructions are inflated only
+// when deltas is set; otherwise its header is enough to find the base.
+func (s *objectStorage) inflate(p *objectPack, offset int64, deltas bool) (packEntry, error) {
 	var e packEntry
 	if offset < 12 || offset >= p.end {
 		return e, errors.New("git pack offset out of bounds")
@@ -236,6 +245,9 @@ func (s *objectStorage) inflate(p *objectPack, offset int64) (packEntry, error) 
 		if _, err = e.baseID.ReadFrom(r); err != nil {
 			return e, err
 		}
+	}
+	if e.kind.IsDelta() && !deltas {
+		return e, nil
 	}
 	if inflater.reader == nil {
 		inflater.reader, err = zlib.NewReader(r)

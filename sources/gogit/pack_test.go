@@ -53,7 +53,7 @@ func TestPackedObjectBounds(t *testing.T) {
 			data := append(make([]byte, 12), tc.data...)
 			p := &objectPack{file: packBytes{bytes.NewReader(data)}, end: int64(len(data)), hashSize: 20}
 			s := &objectStorage{ctx: t.Context(), limit: 1024}
-			e, err := s.inflate(p, 12)
+			e, err := s.inflate(p, 12, true)
 			if !tc.valid {
 				require.Error(t, err)
 				return
@@ -64,7 +64,7 @@ func TestPackedObjectBounds(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			s.ctx = ctx
-			_, err = s.inflate(p, 12)
+			_, err = s.inflate(p, 12, true)
 			require.ErrorIs(t, err, context.Canceled)
 		})
 	}
@@ -80,7 +80,7 @@ func FuzzPackedObject(f *testing.F) {
 		data := append(make([]byte, 12), input...)
 		p := &objectPack{file: packBytes{bytes.NewReader(data)}, end: int64(len(data)), hashSize: 20}
 		s := &objectStorage{ctx: t.Context(), limit: 65536}
-		e, err := s.inflate(p, 12)
+		e, err := s.inflate(p, 12, true)
 		if err == nil {
 			require.LessOrEqual(t, len(e.raw), 65536)
 		}
@@ -129,7 +129,7 @@ func TestPackedObjects(t *testing.T) {
 						break
 					}
 					require.NoError(t, err)
-					entry, err := store.inflate(p, int64(e.Offset))
+					entry, err := store.inflate(p, int64(e.Offset), true)
 					require.NoError(t, err)
 					if entry.kind.IsDelta() {
 						deltas++

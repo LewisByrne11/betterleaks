@@ -684,6 +684,10 @@ Repositories cloned with `--shared` or `--reference`, and submodule checkouts
 scanned directly, need `--allow-external-objects`. Relative alternates are not
 supported.
 
+Symlinks inside Git storage must stay inside it, and storage files must be
+regular files, even with `--allow-external-objects`. A FIFO or device stops the
+scan instead of blocking it.
+
 ### Remote repositories
 
 HTTP(S) repositories are fetched in Go into a temporary mirror, with no checkout

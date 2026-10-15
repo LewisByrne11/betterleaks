@@ -121,6 +121,8 @@ func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *t
 
 // Lightweight tags have no message. Nested annotations are scanned too, but
 // only the outer annotation has a tag ref suitable for generating a web link.
+// Keep each ref occurrence: prefilters and finding attribution depend on the
+// source ref, even when several refs share the same annotation object.
 func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sources.FragmentsFunc) error {
 	refs, err := r.Tags()
 	if err != nil {

@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/betterleaks/betterleaks/v2/sources"
+	"github.com/go-git/go-billy/v6/osfs"
 	"github.com/go-git/go-git/v6/plumbing"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/stretchr/testify/require"
@@ -262,4 +264,107 @@ func TestMatchesGitLog(t *testing.T) {
 	want := lines(fromGit)
 	require.NotEmpty(t, want)
 	require.Equal(t, want, lines(collect(t, &Source{RepoPath: repo})))
+}
+
+func TestUnsafeStorageFiles(t *testing.T) {
+	for _, name := range []string{"loose", "fanout", "pack", "idx", "rev", "pack-directory", "shallow", "alternates", "info-directory", "commondir"} {
+		t.Run(name, func(t *testing.T) {
+			repo := initRepo(t)
+			commitFile(t, repo, "secret", "TOKEN_LOCAL\n", "root")
+			gitDir := filepath.Join(repo, ".git")
+			var target string
+			switch name {
+			case "loose", "fanout":
+				id := gitFixture(t, repo, "rev-parse", "HEAD:secret")
+				target = filepath.Join(gitDir, "objects", id[:2], id[2:])
+				if name == "fanout" {
+					target = filepath.Dir(target)
+				}
+			case "pack", "idx", "rev", "pack-directory":
+				gitFixture(t, repo, "-c", "pack.writeReverseIndex=true", "repack", "-ad")
+				target = filepath.Join(gitDir, "objects", "pack")
+				if name != "pack-directory" {
+					paths, err := filepath.Glob(filepath.Join(target, "*."+name))
+					require.NoError(t, err)
+					require.Len(t, paths, 1)
+					target = paths[0]
+				}
+			case "info-directory":
+				target = filepath.Join(gitDir, "objects", "info")
+			default:
+				target = filepath.Join(gitDir, name)
+				if name == "alternates" {
+					target = filepath.Join(gitDir, "objects", "info", name)
+				}
+				require.NoError(t, os.WriteFile(target, nil, 0600))
+			}
+			outside := filepath.Join(t.TempDir(), "outside")
+			require.NoError(t, os.Rename(target, outside))
+			if err := os.Symlink(outside, target); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			t.Setenv("PATH", t.TempDir())
+			for _, allow := range []bool{false, true} {
+				// AllowExternalObjects permits explicit stores, not linked files.
+				s := &Source{RepoPath: repo, AllowExternalObjects: allow}
+				err := s.Fragments(t.Context(), func(f sources.Fragment, err error) error {
+					require.Empty(t, f.Raw, "must not expose linked content")
+					return err
+				})
+				require.Error(t, err)
+			}
+		})
+	}
+	t.Run("pointer symlink", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "pointer")
+		require.NoError(t, os.WriteFile(outside, []byte("gitdir: /other/repo\n"), 0600))
+		pointer := filepath.Join(t.TempDir(), ".git")
+		if err := os.Symlink(outside, pointer); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		_, err := readGitFile(pointer)
+		require.Error(t, err)
+	})
+	t.Run("FIFOs", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Unix FIFO fixture")
+		}
+		mkfifo, err := exec.LookPath("mkfifo")
+		if err != nil {
+			t.Skip("mkfifo fixture generator unavailable")
+		}
+		root := t.TempDir()
+		fs := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+		for _, path := range []string{"shallow", "commondir", "objects/info/alternates", "objects/ab/cd", "objects/pack/pack-test.pack"} {
+			full := filepath.Join(root, path)
+			require.NoError(t, os.MkdirAll(filepath.Dir(full), 0700))
+			out, err := exec.Command(mkfifo, full).CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			_, err = fs.Open(path)
+			require.ErrorContains(t, err, "not a regular file")
+		}
+		_, err = readSmallFile(filepath.Join(root, "commondir"))
+		require.ErrorContains(t, err, "not a regular file")
+		_, err = (layout{common: root}).alternates()
+		require.ErrorContains(t, err, "not a regular file")
+		_, err = readShallow(fs)
+		require.ErrorContains(t, err, "not a regular file")
+		out, err := exec.Command(mkfifo, filepath.Join(root, "refs")).CombinedOutput()
+		require.NoError(t, err, "%s", out)
+		_, err = fs.ReadDir("refs")
+		require.ErrorContains(t, err, "not a directory")
+	})
+}
+
+func TestShallowLimits(t *testing.T) {
+	root := t.TempDir()
+	fs := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+	path := filepath.Join(root, "shallow")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("1", 40)+"\n"), 0600))
+	ids, err := readShallow(fs)
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	require.NoError(t, os.Truncate(path, maxShallowBytes+1))
+	_, err = readShallow(fs)
+	require.ErrorContains(t, err, "exceeds")
 }

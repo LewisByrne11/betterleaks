@@ -21,6 +21,7 @@ const (
 	maxTreeDepth          = 256       // Directory nesting.
 	maxDiffLines          = 1_000_000 // Lines in one diff pair; larger files are scanned in full.
 	maxDeltaChain         = 10_000    // Delta links per object. Git packs at most 4,095.
+	maxShallowBytes       = 8 << 20   // The shallow file of boundary commits.
 	maxTagNesting         = 32        // Annotated tags naming annotated tags.
 	maxUnreachableObjects = 8_000_000 // Object IDs held to classify reachability.
 	maxReflogRecord       = 1 << 20   // Bytes in one reflog record.

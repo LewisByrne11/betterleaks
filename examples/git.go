@@ -3,7 +3,7 @@
 // Run from the repository root:
 //
 //	go run examples/git.go -repo ../my-repo
-//	go run examples/git.go -repo ../my-repo -all
+//	go run examples/git.go -repo ../my-repo -revision HEAD
 //	go run examples/git.go -repo ../my-repo -since 2025-01-01T00:00:00Z -until 2025-01-31T23:59:59Z
 //	go run examples/git.go -repo ../my-repo -author '<alice@example[.]com>'
 //	go run examples/git.go -repo ../my-repo -since 2025-01-01T00:00:00Z -author '(?i)alice'
@@ -11,8 +11,8 @@
 //	go run examples/git.go -repo ../my-repo -include commit-messages,notes -exclude merges
 //	go run examples/git.go -repo ../my-repo -include commit-messages -exclude history
 //
-// Defaults to HEAD's history, including first-parent merge patches. -all selects
-// all branch, remote-tracking, and tag refs; it cannot be combined with -revision.
+// Defaults to HEAD and all refs, including first-parent merge patches.
+// Use -revision to restrict the history to a revision or an A..B range.
 // Dates are inclusive bounds on committer time, not author time. Identity filters
 // are Go regular expressions over "Name <email>". Supplied filters combine with AND.
 // Include adds resources; exclude removes them. To scan only messages, explicitly
@@ -54,8 +54,7 @@ func run() error {
 		Logger:          slog.Default(),
 	}
 	flag.StringVar(&source.RepoPath, "repo", ".", "Local repository path")
-	flag.BoolVar(&source.All, "all", false, "Scan history reachable from all refs")
-	flag.StringVar(&source.Revision, "revision", "", "Start at a revision instead of HEAD")
+	flag.StringVar(&source.Revision, "revision", "", "Revision or A..B range; defaults to HEAD and all refs")
 	flag.StringVar(&source.Author, "author", "", "Author name/email regular expression")
 	flag.StringVar(&source.Committer, "committer", "", "Committer name/email regular expression")
 	since := flag.String("since", "", "Inclusive committer timestamp, RFC3339")

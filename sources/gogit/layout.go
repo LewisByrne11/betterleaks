@@ -3,11 +3,11 @@ package gogit
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/go-git/go-billy/v6/osfs"
 	git "github.com/go-git/go-git/v6"
 )
 
@@ -156,23 +156,15 @@ func (l layout) registeredWorktree() (string, bool) {
 
 // alternates lists the object directories named by objects/info/alternates.
 func (l layout) alternates() ([]string, error) {
-	f, err := os.Open(filepath.Join(l.common, "objects", "info", "alternates"))
+	data, err := readLimited(storageFS(l.common), "objects/info/alternates", maxAlternatesBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxAlternatesBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxAlternatesBytes {
-		return nil, fmt.Errorf("git alternates file exceeds %d bytes", maxAlternatesBytes)
-	}
 	var paths []string
-	for line := range strings.SplitSeq(string(data), "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -211,24 +203,9 @@ func resolveFrom(dir, path string) string {
 
 // readSmallFile reads a regular pointer file such as .git or commondir.
 func readSmallFile(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", path)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxPathFileBytes+1))
-	if err != nil {
-		return "", err
-	}
-	if len(data) > maxPathFileBytes {
-		return "", fmt.Errorf("%s exceeds %d bytes", path, maxPathFileBytes)
-	}
-	return string(data), nil
+	return readLimited(storageFS(filepath.Dir(path)), filepath.Base(path), maxPathFileBytes)
+}
+
+func storageFS(root string) readOnlyFS {
+	return readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
 }

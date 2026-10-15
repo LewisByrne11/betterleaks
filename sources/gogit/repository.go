@@ -1,11 +1,11 @@
 package gogit
 
 import (
-	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,15 +25,18 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var root string
+	if !s.AllowExternalObjects {
+		root, err = l.storeRoot()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	alternates, err := l.alternates()
 	if err != nil {
 		return nil, nil, err
 	}
 	if !s.AllowExternalObjects {
-		root, err := l.storeRoot()
-		if err != nil {
-			return nil, nil, err
-		}
 		for _, path := range alternates {
 			if inside, err := within(root, path); err != nil || !inside {
 				return nil, nil, errors.Join(err, fmt.Errorf("%w: %s", ErrExternalStore, path))
@@ -57,8 +60,8 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 	// Billy confines absolute paths to its root, and alternates can lie outside
 	// the Git directory, so alternate reads get a filesystem root. Confinement
 	// above has already checked each alternate path.
-	root := filepath.VolumeName(l.common) + string(filepath.Separator)
-	altFS := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+	volumeRoot := filepath.VolumeName(l.common) + string(filepath.Separator)
+	altFS := readOnlyFS{Filesystem: osfs.New(volumeRoot), objectRoot: volumeRoot}
 	objects := &objectCache{cache.NewObjectLRU(cache.FileSize(budget) << 20)}
 	store := filesystem.NewStorageWithOptions(fs, objects, filesystem.Options{LargeObjectThreshold: 1 << 20, AlternatesFS: altFS})
 	reader := &objectStorage{Storage: store, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, defaultMaxBlobBytes), shallow: shallow}
@@ -82,18 +85,16 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 // readShallow lists the boundary commits of a shallow clone. Like Git, the
 // source treats them as root commits: their parents were never fetched.
 func readShallow(fs billy.Filesystem) (map[plumbing.Hash]struct{}, error) {
-	f, err := fs.Open("shallow")
+	data, err := readLimited(fs, "shallow", maxShallowBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	ids := make(map[plumbing.Hash]struct{})
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for line := range strings.SplitSeq(data, "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -102,7 +103,25 @@ func readShallow(fs billy.Filesystem) (map[plumbing.Hash]struct{}, error) {
 		}
 		ids[plumbing.NewHash(line)] = struct{}{}
 	}
-	return ids, scanner.Err()
+	return ids, nil
+}
+
+// readLimited reads a small metadata file such as .git, commondir, alternates,
+// or shallow, refusing one larger than limit.
+func readLimited(fs billy.Filesystem, path string, limit int64) (string, error) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > limit {
+		return "", fmt.Errorf("%s exceeds %d bytes", path, limit)
+	}
+	return string(data), nil
 }
 
 // Read-only mappings remove random pack/index read syscalls. Resident mapped
@@ -115,14 +134,29 @@ type readOnlyFS struct {
 }
 
 func (f readOnlyFS) Open(path string) (billy.File, error) {
+	fs := f.Filesystem
 	if strings.HasPrefix(filepath.ToSlash(path), "objects/pack/") && (strings.HasSuffix(path, ".idx") || strings.HasSuffix(path, ".rev") || strings.HasSuffix(path, ".pack")) {
-		return osfs.New(f.objectRoot, osfs.WithMmap()).Open(path)
+		fs = osfs.New(f.objectRoot, osfs.WithMmap())
 	}
-	return f.Filesystem.Open(path)
+	// osfs opens through os.Root, so symlinks cannot leave the repository. A FIFO
+	// or device would block or never end; open without waiting and reject it.
+	file, err := fs.OpenFile(path, os.O_RDONLY|nonBlocking, 0)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, errors.Join(err, fmt.Errorf("git storage %q is not a regular file", path))
+	}
+	return file, nil
 }
 
 // Git ignores dotfiles in ref directories (for example fixture .gitkeep files).
 func (f readOnlyFS) ReadDir(path string) ([]os.DirEntry, error) {
+	// Listing opens the path, which would block on a FIFO.
+	if info, err := f.Filesystem.Stat(path); err == nil && !info.IsDir() {
+		return nil, fmt.Errorf("git storage %q is not a directory", path)
+	}
 	entries, err := f.Filesystem.ReadDir(path)
 	if err != nil {
 		return nil, err
