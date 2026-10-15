@@ -3,7 +3,6 @@ package gogit
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -57,7 +56,8 @@ func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]
 		return err
 	}
 	if binary {
-		return nil
+		// Nothing in a binary predecessor matches a text line.
+		return emit(dst, 1)
 	}
 	if !cacheable {
 		return w.differ.additions(ctx, src, dst, emit)
@@ -110,11 +110,6 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Tokens must fit the edit engine's Unicode alphabet. This also bounds the
-	// bookkeeping allocated for a diff independently of its input byte limit.
-	if strings.Count(src, "\n")+strings.Count(dst, "\n")+2 > 1_000_000 {
-		return errors.New("diff inputs exceed the one-million-line token limit")
-	}
 	// These are the common-prefix cases the edit engine would remove anyway.
 	// Require a line boundary: appending bytes to an unterminated final line
 	// replaces that line instead of introducing a new one.
@@ -123,6 +118,12 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 	}
 	if strings.HasPrefix(dst, src) && (src == "" || src[len(src)-1] == '\n') {
 		return emit(strings.Clone(dst[len(src):]), strings.Count(src, "\n")+1)
+	}
+	// Tokens must fit the edit engine's Unicode alphabet. This also bounds the
+	// bookkeeping allocated for a diff independently of its input byte limit.
+	// Larger files are scanned whole, which can only add findings.
+	if strings.Count(src, "\n")+strings.Count(dst, "\n")+2 > maxDiffLines {
+		return emit(dst, 1)
 	}
 	// Only parent lines can be matches. Tokenize them once; destination-only
 	// lines need neither IDs nor strings in the dictionary. Use valid Unicode
@@ -225,10 +226,11 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 		added[i] = true
 	}
 	// The edit engine has no context hook. Bound its synchronous search rather
-	// than leaving a background goroutine running after cancellation. Reject
-	// timeout approximations: they must not silently change patch coverage.
+	// than leaving a background goroutine running after cancellation. A search
+	// that runs out of time returns an approximate edit script, so scan the
+	// whole file instead: that can repeat findings but never drops any.
 	dmp := diffmatchpatch.New()
-	dmp.DiffTimeout = time.Minute
+	dmp.DiffTimeout = diffTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		dmp.DiffTimeout = min(dmp.DiffTimeout, max(time.Until(deadline), time.Nanosecond))
 	}
@@ -238,7 +240,7 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 		return err
 	}
 	if time.Since(started) >= dmp.DiffTimeout {
-		return errors.New("git diff exceeded its one-minute computation budget")
+		return emit(dst, 1)
 	}
 	at := 0
 	for _, chunk := range chunks {
@@ -294,7 +296,7 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	obj, err := w.store.read(e.TreeEntry.Hash, 0)
+	obj, err := w.store.read(e.TreeEntry.Hash)
 	if err != nil {
 		return "", false, err
 	}
@@ -302,9 +304,9 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 		return "", false, plumbing.ErrObjectNotFound
 	}
 	if obj.Size() > w.maxBlob {
-		return "", false, fmt.Errorf("blob %s size %d exceeds diff input limit %d", e.TreeEntry.Hash, obj.Size(), w.maxBlob)
+		return "", false, limitf("blob %s size %d exceeds limit %d", e.TreeEntry.Hash, obj.Size(), w.maxBlob)
 	}
-	return obj.raw, strings.IndexByte(obj.raw[:min(len(obj.raw), 8000)], 0) >= 0, nil
+	return obj.raw, strings.IndexByte(obj.raw[:min(len(obj.raw), binarySniffBytes)], 0) >= 0, nil
 }
 
 func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[string]string, yield sources.FragmentsFunc) error {
@@ -321,7 +323,7 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 	if format == nil {
 		return nil
 	}
-	file, err := w.store.read(e.TreeEntry.Hash, 0)
+	file, err := w.store.read(e.TreeEntry.Hash)
 	if err != nil {
 		return err
 	}

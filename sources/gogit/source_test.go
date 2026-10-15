@@ -110,9 +110,9 @@ func TestSource(t *testing.T) {
 				require.Equal(t, expected, textOccurrences(fs))
 				for _, f := range fs {
 					require.Len(t, f.Attr(sources.AttrGitSHA), 40)
-					require.Len(t, f.Attr(AttrBlobSHA), 40)
+					require.Len(t, f.Attr(sources.AttrGitBlobSHA), 40)
 					require.NotEmpty(t, f.Attr(sources.AttrGitAuthorName))
-					require.NotEmpty(t, f.Attr(AttrCommitterDate))
+					require.NotEmpty(t, f.Attr(sources.AttrGitCommitterDate))
 					require.Equal(t, sources.ResourceGitPatchContent, f.Attr(sources.AttrResource))
 				}
 			}
@@ -124,13 +124,29 @@ func TestSource(t *testing.T) {
 	t.Run("alternates", func(t *testing.T) {
 		shared := filepath.Join(t.TempDir(), "shared")
 		gitFixture(t, repo, "clone", "-q", "--shared", repo, shared)
-		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: shared})))
+		err := (&Source{RepoPath: shared}).Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from external alternate"); return nil })
+		require.ErrorIs(t, err, ErrExternalStore)
+		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: shared, AllowExternalObjects: true})))
 	})
 	t.Run("shallow", func(t *testing.T) {
+		// Like git log -p, the boundary commit is compared with an empty tree.
 		shallow := filepath.Join(t.TempDir(), "shallow")
 		gitFixture(t, repo, "clone", "-q", "--depth=1", "file://"+repo, shallow)
-		err := (&Source{RepoPath: shallow}).Fragments(t.Context(), func(sources.Fragment, error) error { t.Fatal("yield from unsupported shallow history"); return nil })
-		require.ErrorContains(t, err, "shallow")
+		fs := collect(t, &Source{RepoPath: shallow})
+		require.Equal(t, map[string]string{"first\nTOKEN_CHANGED\nlast\n": "renamed.txt:1", "TOKEN_SIDE\n": "side.txt:1"}, textOccurrences(fs))
+		boundary := gitFixture(t, shallow, "rev-parse", "HEAD")
+		for _, f := range fs {
+			require.Equal(t, boundary, f.Attr(sources.AttrGitSHA))
+		}
+		deeper := filepath.Join(t.TempDir(), "deeper")
+		gitFixture(t, repo, "clone", "-q", "--depth=3", "file://"+repo, deeper)
+		require.Equal(t, expected["TOKEN_SIDE\n"], textOccurrences(collect(t, &Source{RepoPath: deeper}))["TOKEN_SIDE\n"])
+	})
+	t.Run("subdirectory", func(t *testing.T) {
+		sub := filepath.Join(repo, "sub", "dir")
+		require.NoError(t, os.MkdirAll(sub, 0700))
+		defer os.RemoveAll(filepath.Join(repo, "sub"))
+		require.Equal(t, expected, textOccurrences(collect(t, &Source{RepoPath: sub})))
 	})
 	t.Run("cancel-slow-consumer", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -190,10 +206,30 @@ func TestSource(t *testing.T) {
 		require.ErrorIs(t, (&Source{RepoPath: repo}).Fragments(ctx, func(sources.Fragment, error) error { t.Fatal("yield after cancellation"); return nil }), context.Canceled)
 	})
 	t.Run("limits", func(t *testing.T) {
-		err := (&Source{RepoPath: repo, MaxBlobBytes: 1}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
-		require.ErrorContains(t, err, "diff input limit")
-		require.Error(t, (&Source{RepoPath: repo, Author: "["}).Validate())
-		require.Error(t, (&Source{RepoPath: repo, Include: []string{"reflogs"}}).Validate())
+		// Oversized blobs are reported and skipped; the scan still finishes.
+		var mu sync.Mutex
+		var skipped []error
+		err := (&Source{RepoPath: repo, MaxBlobBytes: 1}).Fragments(t.Context(), func(f sources.Fragment, err error) error {
+			mu.Lock()
+			defer mu.Unlock()
+			require.Error(t, err, "every blob in the fixture exceeds one byte")
+			require.True(t, isLimit(err), "%v", err)
+			require.Contains(t, err.Error(), "path")
+			skipped = append(skipped, err)
+			return nil
+		})
+		require.NoError(t, err)
+		require.NotEmpty(t, skipped)
+		for _, bad := range []*Source{
+			{RepoPath: repo, Author: "["},
+			{RepoPath: repo, Include: []string{"reflogs"}},
+			{RepoPath: repo, Revision: "main...side"},
+			{RepoPath: repo, MaxBlobBytes: 5 << 30},
+			{RepoPath: repo, Workers: 17},
+			{RepoPath: repo, DiskCacheMiB: -1},
+		} {
+			require.Error(t, bad.Validate())
+		}
 	})
 	t.Run("bare-and-worktree", func(t *testing.T) {
 		bare := filepath.Join(t.TempDir(), "bare")
@@ -297,7 +333,7 @@ func TestSHA256(t *testing.T) {
 	gitFixture(t, repo, "repack", "-ad")
 	fs := collect(t, &Source{RepoPath: repo})
 	require.Len(t, fs, 1)
-	require.Len(t, fs[0].Attr(AttrBlobSHA), 64)
+	require.Len(t, fs[0].Attr(sources.AttrGitBlobSHA), 64)
 	require.Len(t, fs[0].Attr(sources.AttrGitSHA), 64)
 	root := gitFixture(t, repo, "rev-parse", "HEAD")
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "secret"), []byte("ABANDONED_SHA256\n"), 0644))
@@ -373,23 +409,23 @@ func TestAllHistoryCoverage(t *testing.T) {
 				}
 				return result
 			}
-			actual := messages(&Source{RepoPath: repo, All: true})
+			actual := messages(&Source{RepoPath: repo})
 			require.Len(t, actual, len(expected))
 			for _, sha := range expected {
 				require.Equal(t, 1, actual[sha], "missing or repeated commit %s", sha)
 			}
 			require.Contains(t, actual, side)
 			require.Contains(t, actual, orphan)
-			limited := messages(&Source{RepoPath: repo, All: true, MaxCount: 1})
+			limited := messages(&Source{RepoPath: repo, MaxCount: 1})
 			require.Equal(t, map[string]int{shared: 1}, limited)
 			since := time.Date(2009, 1, 1, 0, 0, 0, 0, time.UTC)
-			selected := messages(&Source{RepoPath: repo, All: true, Since: &since})
+			selected := messages(&Source{RepoPath: repo, Since: &since})
 			require.Equal(t, map[string]int{side: 1, merge: 1, shared: 1}, selected)
 			// Invalid refs must not be quietly skipped as upstream's All iterator does.
 			missing := strings.Repeat("1", len(root))
 			gitFixture(t, repo, "update-ref", "refs/heads/broken", root)
 			require.NoError(t, os.WriteFile(filepath.Join(repo, ".git", "refs", "heads", "broken"), []byte(missing+"\n"), 0644))
-			err := (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			err := (&Source{RepoPath: repo}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 			require.ErrorContains(t, err, "broken")
 			gitFixture(t, repo, "update-ref", "-d", "refs/heads/broken")
 			// A syntactically valid commit can still name an unavailable parent.
@@ -400,7 +436,7 @@ func TestAllHistoryCoverage(t *testing.T) {
 			written, err := write.CombinedOutput()
 			require.NoError(t, err, "%s", written)
 			gitFixture(t, repo, "update-ref", "refs/heads/incomplete", strings.TrimSpace(string(written)))
-			err = (&Source{RepoPath: repo, All: true}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
+			err = (&Source{RepoPath: repo}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 			require.ErrorContains(t, err, "parent "+missing)
 		})
 	}
@@ -415,19 +451,19 @@ func BenchmarkHistory(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for range b.N {
-		s := &Source{RepoPath: path, All: true}
+		s := &Source{RepoPath: path}
 		r, cleanup, err := s.open(b.Context())
 		if err != nil {
 			b.Fatal(err)
 		}
-		h, err := s.history(b.Context(), r, scanPatches)
+		h, err := s.history(b.Context(), r)
 		if err != nil {
 			cleanup()
 			b.Fatal(err)
 		}
 		n, frontier := 0, 0
 		for {
-			_, _, err := h.next(b.Context())
+			_, err := h.next(b.Context())
 			if err == io.EOF {
 				break
 			}
@@ -463,7 +499,7 @@ func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 	gitFixture(t, repo, "reset", "-q", "HEAD", "uncommitted")
 	require.NoError(t, os.Remove(filepath.Join(repo, "uncommitted")))
 	t.Setenv("PATH", t.TempDir())
-	fs := collect(t, &Source{RepoPath: repo, All: true, Include: []string{"commit-messages", "notes", "unreachable-objects"}})
+	fs := collect(t, &Source{RepoPath: repo, Include: []string{"commit-messages", "notes", "unreachable-objects"}})
 	var notes []string
 	var blobs, patches, messages int
 	for _, f := range fs {
@@ -480,7 +516,7 @@ func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 		case sources.ResourceGitBlob:
 			blobs++
 			require.Equal(t, "LOOSE_SECRET\n", f.Raw)
-			require.Equal(t, looseID, f.Attr(AttrBlobSHA))
+			require.Equal(t, looseID, f.Attr(sources.AttrGitBlobSHA))
 			require.Empty(t, f.Attr(sources.AttrGitSHA))
 			require.Empty(t, f.Attr(sources.AttrPath))
 		case sources.ResourceGitPatchContent:
@@ -493,11 +529,11 @@ func TestUnreachableBlobsAndNotesWithoutGit(t *testing.T) {
 	require.Equal(t, 1, blobs)
 	require.Equal(t, 1, patches)
 	require.Equal(t, 1, messages)
-	fs = collect(t, &Source{RepoPath: repo, All: true})
+	fs = collect(t, &Source{RepoPath: repo})
 	require.Len(t, fs, 1)
 	require.Equal(t, "COMMITTED_SECRET\n", fs[0].Raw)
 	stop := errors.New("stop loose")
-	err := (&Source{RepoPath: repo, All: true, Include: []string{"unreachable-objects"}, Prefilter: func(a map[string]string) bool { return a[sources.AttrResource] != sources.ResourceGitBlob }}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
+	err := (&Source{RepoPath: repo, Include: []string{"unreachable-objects"}, Prefilter: func(a map[string]string) bool { return a[sources.AttrResource] != sources.ResourceGitBlob }}).Fragments(t.Context(), func(sources.Fragment, error) error { return stop })
 	require.ErrorIs(t, err, stop)
 }
 
@@ -516,15 +552,13 @@ func TestUnbornLooseArchive(t *testing.T) {
 	id := gitFixture(t, repo, "hash-object", "-w", name)
 	require.NoError(t, os.Remove(name))
 	t.Setenv("PATH", t.TempDir())
-	for _, all := range []bool{false, true} {
-		fs := collect(t, &Source{RepoPath: repo, All: all, Include: []string{"unreachable-objects"}, MaxArchiveDepth: 1})
-		require.Len(t, fs, 1)
-		require.Equal(t, "LOOSE_ARCHIVE_SECRET\n", fs[0].Raw)
-		require.Equal(t, sources.ResourceGitBlob, fs[0].Attr(sources.AttrResource))
-		require.Equal(t, id, fs[0].Attr(AttrBlobSHA))
-		require.Contains(t, fs[0].Attr(sources.AttrPath), "secret.txt")
-		require.Empty(t, fs[0].Attr(sources.AttrGitSHA))
-	}
+	fs := collect(t, &Source{RepoPath: repo, Include: []string{"unreachable-objects"}, MaxArchiveDepth: 1})
+	require.Len(t, fs, 1)
+	require.Equal(t, "LOOSE_ARCHIVE_SECRET\n", fs[0].Raw)
+	require.Equal(t, sources.ResourceGitBlob, fs[0].Attr(sources.AttrResource))
+	require.Equal(t, id, fs[0].Attr(sources.AttrGitBlobSHA))
+	require.Contains(t, fs[0].Attr(sources.AttrPath), "secret.txt")
+	require.Empty(t, fs[0].Attr(sources.AttrGitSHA))
 	err = (&Source{RepoPath: repo, Revision: "missing"}).Fragments(t.Context(), func(sources.Fragment, error) error { return nil })
 	require.ErrorContains(t, err, "resolve revision")
 }
@@ -550,7 +584,7 @@ func TestPackedNotesInWorktree(t *testing.T) {
 			require.Equal(t, "refs/notes/review", f.Attr("git.notes_ref"))
 		case sources.ResourceGitBlob:
 			require.Equal(t, "WORKTREE_LOOSE_SECRET\n", f.Raw)
-			require.Equal(t, id, f.Attr(AttrBlobSHA))
+			require.Equal(t, id, f.Attr(sources.AttrGitBlobSHA))
 		default:
 			t.Fatalf("unexpected resource %q", f.Attr(sources.AttrResource))
 		}
@@ -595,7 +629,7 @@ func TestGitResourceSelection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
-			for _, f := range collect(t, &Source{RepoPath: repo, All: true, Include: tc.include, Exclude: tc.exclude}) {
+			for _, f := range collect(t, &Source{RepoPath: repo, Include: tc.include, Exclude: tc.exclude}) {
 				got = append(got, f.Raw)
 			}
 			require.ElementsMatch(t, tc.want, got)
@@ -641,10 +675,10 @@ func TestExcludedGitResourcesAreNotRead(t *testing.T) {
 	require.Error(t, err, "history would need the removed tree")
 	// Neither notes nor all-object scans need the ordinary HEAD commit.
 	require.NoError(t, os.Remove(filepath.Join(repo, ".git", "objects", commitID[:2], commitID[2:])))
-	fs = collect(t, &Source{RepoPath: repo, All: true, Include: []string{"notes"}, Exclude: []string{"history"}})
+	fs = collect(t, &Source{RepoPath: repo, Include: []string{"notes"}, Exclude: []string{"history"}})
 	require.Len(t, fs, 1)
 	require.Equal(t, "NOTE_SECRET\n", fs[0].Raw)
-	fs = collect(t, &Source{RepoPath: repo, All: true, Include: []string{"objects"}, Exclude: []string{"history"}})
+	fs = collect(t, &Source{RepoPath: repo, Include: []string{"objects"}, Exclude: []string{"history"}})
 	var raw []string
 	for _, f := range fs {
 		raw = append(raw, f.Raw)
@@ -707,8 +741,8 @@ func TestTreeExpansionBudget(t *testing.T) {
 				require.NoError(t, err)
 				tree.Entries = []object.TreeEntry{{Name: "a", Mode: filemode.Dir, Hash: id}, {Name: "b", Mode: filemode.Dir, Hash: id}}
 			}
-			changes, err := rawTreeChanges(t.Context(), &object.Commit{TreeHash: id}, &treeCache{r: repo})
-			require.ErrorContains(t, err, "expansion budget")
+			changes, err := rawTreeChanges(t.Context(), &treeCache{r: repo}, &object.Commit{TreeHash: id}, plumbing.ZeroHash)
+			require.True(t, isLimit(err), "%v", err)
 			require.Empty(t, changes, "an incomplete comparison must not yield partial patches")
 		})
 	}

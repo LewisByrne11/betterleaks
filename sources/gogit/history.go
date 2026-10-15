@@ -14,31 +14,24 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
-// go-git's All iterator materializes every commit in a linked list, and stops a
-// ref walk at the first shared commit even when other merge ancestry is pending.
-// Keep one shared visited set and a frontier of IDs/timestamps instead. Decoded
-// commits (and their retained pack readers) live only while a worker needs them.
+// history walks commits newest first by committer time from a set of roots,
+// visiting each commit once. go-git's All iterator materializes every commit in
+// a linked list, and stops a ref walk at the first shared commit even when
+// other merge ancestry is pending. This keeps one visited set and a frontier of
+// IDs and timestamps instead. Decoded commits (and their retained pack readers)
+// live only while a worker needs them.
 type history struct {
 	r        *git.Repository
-	seen     map[plumbing.Hash]commitResources
-	scope    commitResources
-	selected int
+	store    *objectStorage
+	seen     map[plumbing.Hash]struct{}
 	frontier commitHeap
 	sequence uint64
 }
-type commitResources uint8
-
-const (
-	scanMessages commitResources = 1 << iota
-	scanPatches
-	commitSelected // Counts a commit once across resource passes.
-)
 
 type commitPosition struct {
-	id        plumbing.Hash
-	when      int64
-	sequence  uint64
-	resources commitResources
+	id       plumbing.Hash
+	when     int64
+	sequence uint64
 }
 type commitHeap []commitPosition
 
@@ -58,50 +51,66 @@ func (h *commitHeap) Pop() any {
 	return v
 }
 
-func (s *Source) history(ctx context.Context, r *git.Repository, scope commitResources) (*history, error) {
-	h := &history{r: r, seen: make(map[plumbing.Hash]commitResources), scope: scope, selected: 0, frontier: nil, sequence: 0}
-	if !s.All {
-		revision := s.Revision
-		if revision == "" {
-			revision = "HEAD"
+//nolint:exhaustruct // An empty frontier and sequence start at zero.
+func newWalk(r *git.Repository) *history {
+	return &history{r: r, store: r.Storer.(*objectStorage), seen: make(map[plumbing.Hash]struct{})}
+}
+
+// history starts at Revision when set, otherwise at HEAD and every ref except
+// notes. A range A..B starts at B and excludes everything reachable from A.
+func (s *Source) history(ctx context.Context, r *git.Repository) (*history, error) {
+	h := newWalk(r)
+	if s.Revision == "" {
+		return h, h.refs(ctx)
+	}
+	revision := s.Revision
+	if from, to, isRange := strings.Cut(revision, ".."); isRange {
+		if from == "" {
+			from = "HEAD"
 		}
-		id, err := r.ResolveRevision(plumbing.Revision(revision))
+		if to == "" {
+			to = "HEAD"
+		}
+		id, err := r.ResolveRevision(plumbing.Revision(from))
 		if err != nil {
-			// An unborn default HEAD has no history, but may have staged loose
-			// blobs or notes. Explicit missing revisions remain errors.
-			if s.Revision == "" && errors.Is(err, plumbing.ErrReferenceNotFound) {
-				return h, nil
-			}
-			return nil, fmt.Errorf("resolve revision %q: %w", revision, err)
+			return nil, fmt.Errorf("resolve revision %q: %w", from, err)
 		}
-		if err = h.tip(ctx, *id); err != nil {
+		if err := h.exclude(ctx, *id); err != nil {
 			return nil, err
 		}
-		return h, nil
+		revision = to
 	}
-	head, err := r.Head()
+	id, err := r.ResolveRevision(plumbing.Revision(revision))
+	if err != nil {
+		return nil, fmt.Errorf("resolve revision %q: %w", revision, err)
+	}
+	return h, h.tip(ctx, *id)
+}
+
+func (h *history) refs(ctx context.Context) error {
+	head, err := h.r.Head()
 	if err == nil {
 		if err = h.tip(ctx, head.Hash()); err != nil {
-			return nil, err
+			return err
 		}
 	} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
-		return nil, err
+		return err
 	}
-	refs, err := r.Storer.IterReferences()
+	refs, err := h.r.Storer.IterReferences()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer refs.Close()
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		ref, err := refs.Next()
 		if errors.Is(err, io.EOF) {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if strings.HasPrefix(ref.Name().String(), "refs/notes/") {
 			continue
@@ -110,85 +119,117 @@ func (s *Source) history(ctx context.Context, r *git.Repository, scope commitRes
 		// interpreting their zero hash as an object ID.
 		if ref.Type() == plumbing.SymbolicReference {
 			name := ref.Name()
-			ref, err = storer.ResolveReference(r.Storer, name)
+			ref, err = storer.ResolveReference(h.r.Storer, name)
 			if err != nil {
 				if name == plumbing.HEAD && errors.Is(err, plumbing.ErrReferenceNotFound) {
 					continue // Unborn HEAD; there may still be notes or loose blobs.
 				}
-				return nil, fmt.Errorf("resolve ref %s: %w", name, err)
+				return fmt.Errorf("resolve ref %s: %w", name, err)
 			}
 		}
 		if err = h.tip(ctx, ref.Hash()); err != nil {
-			return nil, fmt.Errorf("ref %s: %w", ref.Name(), err)
+			return fmt.Errorf("ref %s: %w", ref.Name(), err)
 		}
 	}
-	return h, nil
 }
+
+// tip adds a root. Annotated tags are peeled; tags naming trees or blobs have no
+// commit ancestry and add nothing.
 func (h *history) tip(ctx context.Context, id plumbing.Hash) error {
-	for depth := 0; depth < 32; depth++ {
+	c, err := h.peel(ctx, id)
+	if err != nil || c == nil {
+		return err
+	}
+	if _, ok := h.seen[c.Hash]; !ok {
+		h.enqueue(c)
+	}
+	return nil
+}
+
+// exclude marks everything reachable from id as visited, so the walk never
+// reaches it.
+func (h *history) exclude(ctx context.Context, id plumbing.Hash) error {
+	c, err := h.peel(ctx, id)
+	if err != nil || c == nil {
+		return err
+	}
+	pending := []plumbing.Hash{c.Hash}
+	for len(pending) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if h.seen[id]&h.scope == h.scope {
-			return nil
+		id := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if _, ok := h.seen[id]; ok {
+			continue
+		}
+		h.seen[id] = struct{}{}
+		c, err := h.r.CommitObject(id)
+		if err != nil {
+			return fmt.Errorf("excluded commit %s: %w", id, err)
+		}
+		pending = append(pending, h.store.parents(c)...)
+	}
+	return nil
+}
+
+func (h *history) peel(ctx context.Context, id plumbing.Hash) (*object.Commit, error) {
+	for range maxTagNesting {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		obj, err := h.r.Storer.EncodedObject(plumbing.AnyObject, id)
 		if err != nil {
-			return fmt.Errorf("read history tip %s: %w", id, err)
+			return nil, fmt.Errorf("read history tip %s: %w", id, err)
 		}
 		switch obj.Type() {
 		case plumbing.CommitObject:
-			c, err := object.DecodeCommit(h.r.Storer, obj)
-			if err != nil {
-				return err
-			}
-			h.enqueue(c)
-			return nil
+			return object.DecodeCommit(h.r.Storer, obj)
 		case plumbing.TagObject:
 			tag, err := object.DecodeTag(h.r.Storer, obj)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			id = tag.Target
 		case plumbing.BlobObject, plumbing.TreeObject:
-			// Valid tags can name non-commit objects, which have no commit ancestry.
-			return nil
+			return nil, nil
 		default:
-			return fmt.Errorf("invalid history tip type %s", obj.Type())
+			return nil, fmt.Errorf("invalid history tip type %s", obj.Type())
 		}
 	}
-	return errors.New("annotated tag nesting exceeds 32 levels")
+	return nil, fmt.Errorf("annotated tag nesting exceeds %d levels", maxTagNesting)
 }
+
 func (h *history) enqueue(c *object.Commit) {
-	resources := h.scope &^ h.seen[c.Hash]
-	h.seen[c.Hash] |= resources
-	heap.Push(&h.frontier, commitPosition{c.Hash, c.Committer.When.Unix(), h.sequence, resources})
+	h.seen[c.Hash] = struct{}{}
+	heap.Push(&h.frontier, commitPosition{c.Hash, c.Committer.When.Unix(), h.sequence})
 	h.sequence++
 }
-func (h *history) next(ctx context.Context) (*object.Commit, commitResources, error) {
+
+func (h *history) next(ctx context.Context) (*object.Commit, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	if len(h.frontier) == 0 {
-		return nil, 0, io.EOF
+		return nil, io.EOF
 	}
 	p := heap.Pop(&h.frontier).(commitPosition)
 	c, err := h.r.CommitObject(p.id)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	for _, id := range c.ParentHashes {
+	for _, id := range h.store.parents(c) {
 		if err := ctx.Err(); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
-		if h.seen[id]&h.scope == h.scope {
+		if _, ok := h.seen[id]; ok {
 			continue
 		}
 		parent, err := h.r.CommitObject(id)
 		if err != nil {
-			return nil, 0, fmt.Errorf("parent %s of %s: %w", id, c.Hash, err)
+			return nil, fmt.Errorf("parent %s of %s: %w", id, c.Hash, err)
 		}
 		h.enqueue(parent)
 	}
-	return c, p.resources, nil
+	return c, nil
 }

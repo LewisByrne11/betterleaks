@@ -1,11 +1,11 @@
 package gogit
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,92 +16,54 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 )
 
 //nolint:exhaustruct // Unspecified storage options and cache bookkeeping use their zero values.
 func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
-	// Reuse upstream discovery for bare repositories, gitdir files and commondir.
-	// No worktree operations or object traversal run against this initial store.
-	discovered, err := git.PlainOpen(s.RepoPath)
+	l, err := discover(s.RepoPath)
 	if err != nil {
 		return nil, nil, err
 	}
-	initial := discovered.Storer.(*filesystem.Storage)
-	base := initial.Filesystem()
-	objectRoot := base.Root()
-	common, commonErr := base.Open("commondir")
-	if commonErr == nil {
-		path, readErr := io.ReadAll(io.LimitReader(common, 4097))
-		common.Close()
-		if readErr != nil || len(path) > 4096 {
-			initial.Close()
-			return nil, nil, errors.New("could not read bounded commondir path")
-		}
-		objectRoot = strings.TrimSpace(string(path))
-		if !filepath.IsAbs(objectRoot) {
-			objectRoot = filepath.Join(base.Root(), objectRoot)
-		}
-	} else if !errors.Is(commonErr, os.ErrNotExist) {
-		initial.Close()
-		return nil, nil, commonErr
-	}
-	fs := readOnlyFS{Filesystem: base, objectRoot: objectRoot}
-	if err := initial.Close(); err != nil {
+	alternates, err := l.alternates()
+	if err != nil {
 		return nil, nil, err
 	}
-	// Shallow scans need explicit boundary semantics; reject instead of claiming
-	// a complete parent comparison when the available parents are incomplete.
-	shallow, err := fs.Open("shallow")
-	if err == nil {
-		var b [1]byte
-		n, readErr := shallow.Read(b[:])
-		shallow.Close()
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, nil, readErr
+	if !s.AllowExternalObjects {
+		root, err := l.storeRoot()
+		if err != nil {
+			return nil, nil, err
 		}
-		if n > 0 {
-			return nil, nil, errors.New("go-git history source does not yet support shallow repositories")
+		for _, path := range alternates {
+			if inside, err := within(root, path); err != nil || !inside {
+				return nil, nil, errors.Join(err, fmt.Errorf("%w: %s", ErrExternalStore, path))
+			}
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	}
+	dot := osfs.New(l.gitDir, osfs.WithBoundOS())
+	var common billy.Filesystem
+	if l.common != l.gitDir {
+		common = osfs.New(l.common, osfs.WithBoundOS())
+	}
+	fs := readOnlyFS{Filesystem: dotgit.NewRepositoryFilesystem(dot, common), objectRoot: l.common}
+	shallow, err := readShallow(fs)
+	if err != nil {
 		return nil, nil, err
 	}
 	budget := s.CacheMiB
 	if budget == 0 {
 		budget = 256
 	}
-	// Billy confines absolute paths to its root. A shared local clone's
-	// alternates can lie outside the Git directory, so give alternate reads a
-	// filesystem root while retaining the same read-only wrapper. Relative
-	// alternates currently have different semantics in go-git; reject them.
-	alternates, err := fs.Open("objects/info/alternates")
-	if err == nil {
-		data, readErr := io.ReadAll(io.LimitReader(alternates, 65537))
-		alternates.Close()
-		if readErr != nil {
-			return nil, nil, readErr
-		}
-		if len(data) > 65536 {
-			return nil, nil, errors.New("git alternates file exceeds 64 KiB")
-		}
-		for _, path := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			if path != "" && !filepath.IsAbs(path) {
-				return nil, nil, errors.New("go-git source does not yet support relative object alternates")
-			}
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, nil, err
-	}
-	root := filepath.VolumeName(objectRoot) + string(filepath.Separator)
+	// Billy confines absolute paths to its root, and alternates can lie outside
+	// the Git directory, so alternate reads get a filesystem root. Confinement
+	// above has already checked each alternate path.
+	root := filepath.VolumeName(l.common) + string(filepath.Separator)
 	altFS := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
 	objects := &objectCache{cache.NewObjectLRU(cache.FileSize(budget) << 20)}
 	store := filesystem.NewStorageWithOptions(fs, objects, filesystem.Options{LargeObjectThreshold: 1 << 20, AlternatesFS: altFS})
-	reader := &objectStorage{Storage: store, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, 64<<20)}
-	diskBudget := s.DiskCacheMiB
-	if diskBudget == 0 {
-		diskBudget = 1024
-	}
-	if diskBudget > 0 {
-		reader.disk = &diskObjectCache{segmentSize: int64(diskBudget) << 20 / 8}
+	reader := &objectStorage{Storage: store, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, defaultMaxBlobBytes), shallow: shallow}
+	if s.DiskCacheMiB > 0 {
+		reader.disk = &diskObjectCache{segmentSize: int64(s.DiskCacheMiB) << 20 / 8}
 	}
 	if err := reader.openPacks(fs); err != nil {
 		reader.closePacks()
@@ -115,6 +77,32 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 		return nil, nil, err
 	}
 	return r, func() { reader.closePacks(); store.Close() }, nil
+}
+
+// readShallow lists the boundary commits of a shallow clone. Like Git, the
+// source treats them as root commits: their parents were never fetched.
+func readShallow(fs billy.Filesystem) (map[plumbing.Hash]struct{}, error) {
+	f, err := fs.Open("shallow")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	ids := make(map[plumbing.Hash]struct{})
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !plumbing.IsHash(line) {
+			return nil, errors.New("malformed Git shallow file")
+		}
+		ids[plumbing.NewHash(line)] = struct{}{}
+	}
+	return ids, scanner.Err()
 }
 
 // Read-only mappings remove random pack/index read syscalls. Resident mapped

@@ -74,7 +74,7 @@ func TestReflogHistoryAndWorktrees(t *testing.T) {
 	gitFixture(t, repo, "gc")
 	t.Setenv("PATH", t.TempDir())
 	for _, path := range []string{repo, worktree} {
-		s := &Source{RepoPath: path, All: true}
+		s := &Source{RepoPath: path}
 		for _, f := range collect(t, s) {
 			require.NotContains(t, f.Raw, "ABANDONED")
 		}
@@ -101,13 +101,17 @@ func TestReflogHistoryAndWorktrees(t *testing.T) {
 		require.Equal(t, 1, patches, "each commit is scanned once across all roots")
 		require.Equal(t, 1, messages)
 		require.Equal(t, 1, resets, "linked logs are not scanned twice")
-		s.Exclude = []string{"history"}
-		s.Include = []string{"reflog-history", "merges"}
-		found := false
+		// reflog-history adds commits to history or messages; alone it scans nothing.
+		s.Include, s.Exclude = []string{"reflog-history"}, []string{"history"}
+		require.ErrorContains(t, s.Validate(), "reflog-history adds commits")
+		s.Include = []string{"reflog-history", "commit-messages"}
+		var patch, message bool
 		for _, f := range collect(t, s) {
-			found = found || f.Raw == "ABANDONED_SECRET\n"
+			patch = patch || f.Raw == "ABANDONED_SECRET\n"
+			message = message || f.Raw == "ABANDONED_MESSAGE\n"
 		}
-		require.True(t, found)
+		require.False(t, patch, "reflog commits get only the enabled content")
+		require.True(t, message)
 	}
 }
 
@@ -133,9 +137,9 @@ func TestReflogErrorsAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	err := s.Fragments(ctx, func(sources.Fragment, error) error { cancel(); return nil })
 	require.ErrorIs(t, err, context.Canceled)
-	s.Include = []string{"reflog-history"}
+	s.Include, s.Exclude = []string{"reflog-history"}, nil
 	require.ErrorContains(t, s.Fragments(t.Context(), func(sources.Fragment, error) error { return nil }), "read history tip")
-	s.Include = []string{"reflog-messages"}
+	s.Include, s.Exclude = []string{"reflog-messages"}, []string{"history"}
 	for _, bad := range []string{
 		"SECRET_INVALID\n", strings.TrimSuffix(entry, "\n"),
 		strings.Replace(entry, missing, "INVALID_SECRET", 1),
@@ -253,7 +257,6 @@ func TestObjectResourceCoverage(t *testing.T) {
 			{"add unreachable", []string{"unreachable-objects"}, nil, unreachable},
 			{"unreachable only", []string{"unreachable-objects"}, []string{"history"}, unreachable},
 			{"reflog and unreachable", []string{"unreachable-objects", "reflog-history"}, nil, unreachable},
-			{"reflog without history", []string{"unreachable-objects", "reflog-history"}, []string{"history"}, unreachable},
 			{"notes and unreachable", []string{"unreachable-objects", "notes"}, nil, unreachable},
 			{"all objects", []string{"objects"}, nil, all},
 			{"objects only", []string{"objects"}, []string{"history"}, all},
@@ -261,14 +264,14 @@ func TestObjectResourceCoverage(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("packed=%v/%s", packed, tc.name), func(t *testing.T) {
 				t.Setenv("PATH", t.TempDir())
-				s := &Source{RepoPath: repo, All: true, Include: tc.include, Exclude: tc.exclude}
+				s := &Source{RepoPath: repo, Include: tc.include, Exclude: tc.exclude}
 				check := func() {
 					got := make(map[string]bool)
 					for _, f := range collect(t, s) {
 						if f.Attr(sources.AttrResource) != sources.ResourceGitBlob {
 							continue
 						}
-						id := f.Attr(AttrBlobSHA)
+						id := f.Attr(sources.AttrGitBlobSHA)
 						require.False(t, got[id], "duplicate blob %s", id)
 						got[id] = true
 						require.Empty(t, f.Attr(sources.AttrPath))
@@ -278,7 +281,7 @@ func TestObjectResourceCoverage(t *testing.T) {
 				}
 				check()
 				// Selection can suppress every patch without changing object scope.
-				s.All, s.Revision, s.MaxCount, s.Author = false, root, 1, "nobody"
+				s.Revision, s.MaxCount, s.Author = root, 1, "nobody"
 				check()
 			})
 		}
@@ -292,8 +295,9 @@ func TestObjectResourceCoverage(t *testing.T) {
 					t.Setenv("PATH", t.TempDir())
 					for resource, want := range map[string]map[string]bool{"objects": all, "unreachable-objects": unreachable} {
 						got := make(map[string]bool)
-						for _, f := range collect(t, &Source{RepoPath: path, Include: []string{resource}, Exclude: []string{"history"}}) {
-							id := f.Attr(AttrBlobSHA)
+						// The mirror borrows objects from repo through an alternate.
+						for _, f := range collect(t, &Source{RepoPath: path, Include: []string{resource}, Exclude: []string{"history"}, AllowExternalObjects: path == shared}) {
+							id := f.Attr(sources.AttrGitBlobSHA)
 							require.False(t, got[id])
 							got[id] = true
 						}
@@ -321,13 +325,16 @@ func TestReflogHistoryIsAdditive(t *testing.T) {
 		name            string
 		maxCount        int
 		rejectAbandoned bool
+		additions       int
+		additive        bool
 	}{
-		{"defaults", 0, false},
-		{"prefilter", 0, true},
-		{"count limit", 1, false},
+		{"defaults", 0, false, 1, true},
+		{"prefilter", 0, true, 0, true},
+		// One walk takes the newest commits overall: here, the abandoned one.
+		{"count limit", 1, false, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Source{RepoPath: repo, All: true, MaxCount: tc.maxCount, Include: []string{"unreachable-objects"}}
+			s := &Source{RepoPath: repo, MaxCount: tc.maxCount, Include: []string{"unreachable-objects"}}
 			if tc.rejectAbandoned {
 				s.Prefilter = func(attrs map[string]string) bool { return attrs[sources.AttrGitSHA] == abandoned }
 			}
@@ -340,7 +347,9 @@ func TestReflogHistoryIsAdditive(t *testing.T) {
 			s.Include = []string{"unreachable-objects", "reflog-history"}
 			expanded := collect(t, s)
 			for _, f := range baseline {
-				require.Contains(t, expanded, f, "adding reflog history must retain each default fragment")
+				if tc.additive || f.Attr(sources.AttrResource) == sources.ResourceGitBlob {
+					require.Contains(t, expanded, f, "adding reflog history must retain each default fragment")
+				}
 			}
 			additions := 0
 			for _, f := range expanded {
@@ -349,16 +358,14 @@ func TestReflogHistoryIsAdditive(t *testing.T) {
 					require.Equal(t, "ABANDONED_ADDITION\n", f.Raw)
 				}
 			}
-			if !tc.rejectAbandoned && tc.maxCount == 0 {
-				require.Equal(t, 1, additions)
-			} else {
-				require.Zero(t, additions)
-			}
+			require.Equal(t, tc.additions, additions)
 		})
 	}
 }
 
-func TestMessageAndPatchScopes(t *testing.T) {
+// reflog-history adds roots to the one commit walk. Only the enabled content
+// is scanned for those commits, and MaxCount takes the newest commits overall.
+func TestReflogRootsAndCountLimit(t *testing.T) {
 	repo := t.TempDir()
 	gitFixture(t, repo, "init", "-q", "-b", "main")
 	gitFixture(t, repo, "config", "user.name", "Scope Test")
@@ -382,38 +389,26 @@ func TestMessageAndPatchScopes(t *testing.T) {
 	entry := abandoned + " " + base + " Test <test@example.test> 1700000000 +0000\treset\n"
 	require.NoError(t, os.WriteFile(filepath.Join(logs, "HEAD"), []byte(entry), 0600))
 	t.Setenv("PATH", t.TempDir())
-	for _, limit := range []int{0, 1, 2, 3} {
-		s := &Source{RepoPath: repo, All: true, MaxCount: limit, Include: []string{"commit-messages"}, Exclude: []string{"history"}}
-		before := collect(t, s)
-		s.Include = []string{"commit-messages", "reflog-history"}
-		after := collect(t, s)
-		for _, f := range before {
-			require.Contains(t, after, f)
+	messages := func(s *Source) []string {
+		var ids []string
+		for _, f := range collect(t, s) {
+			require.Equal(t, sources.ResourceGitCommitMessage, f.Attr(sources.AttrResource), "messages-only scans add no patches")
+			ids = append(ids, f.Attr(sources.AttrGitSHA))
 		}
-		messages, patches := map[string]int{}, map[string]int{}
-		for _, f := range after {
-			switch f.Attr(sources.AttrResource) {
-			case sources.ResourceGitCommitMessage:
-				messages[f.Attr(sources.AttrGitSHA)]++
-			case sources.ResourceGitPatchContent:
-				patches[f.Attr(sources.AttrGitSHA)]++
-			default:
-				t.Fatalf("unexpected resource %s", f.Attr(sources.AttrResource))
-			}
-		}
-		require.Equal(t, 1, messages[tagOnly])
-		require.Zero(t, patches[tagOnly], "tag-only messages must not introduce file patches")
-		if limit != 1 {
-			require.Equal(t, 1, messages[base])
-			require.Equal(t, 1, patches[base])
-		}
-		if limit == 0 || limit == 3 {
-			require.Equal(t, 1, messages[abandoned])
-			require.Equal(t, 1, patches[abandoned])
-		} else {
-			require.Zero(t, messages[abandoned])
-			require.Zero(t, patches[abandoned])
-		}
+		return ids
+	}
+	require.ElementsMatch(t, []string{tagOnly, base}, messages(&Source{RepoPath: repo, Include: []string{"commit-messages"}, Exclude: []string{"history"}}))
+	for _, tc := range []struct {
+		limit int
+		want  []string
+	}{
+		{0, []string{abandoned, tagOnly, base}},
+		{1, []string{abandoned}},
+		{2, []string{abandoned, tagOnly}},
+		{3, []string{abandoned, tagOnly, base}},
+	} {
+		s := &Source{RepoPath: repo, MaxCount: tc.limit, Include: []string{"commit-messages", "reflog-history"}, Exclude: []string{"history"}}
+		require.ElementsMatch(t, tc.want, messages(s), "limit %d", tc.limit)
 	}
 }
 

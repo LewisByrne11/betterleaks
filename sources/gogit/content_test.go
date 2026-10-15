@@ -89,7 +89,15 @@ func TestLineAdditions(t *testing.T) {
 		return nil
 	}))
 	require.Equal(t, []string{"secret\n"}, additions)
-	require.ErrorContains(t, lineAdditions(t.Context(), strings.Repeat("x\n", 1_000_000), "", func(string, int) error { t.Fatal("oversized line input yielded"); return nil }), "token limit")
+	// Inputs beyond the token limit are scanned whole rather than diffed.
+	require.NoError(t, lineAdditions(t.Context(), strings.Repeat("x\n", 1_000_000), "", func(string, int) error { t.Fatal("an empty file yielded"); return nil }))
+	additions = nil
+	require.NoError(t, lineAdditions(t.Context(), strings.Repeat("x\n", 1_000_000), "y\nx\n", func(raw string, line int) error {
+		require.Equal(t, 1, line)
+		additions = append(additions, raw)
+		return nil
+	}))
+	require.Equal(t, []string{"y\nx\n"}, additions)
 	stop := errors.New("stop")
 	require.ErrorIs(t, lineAdditions(t.Context(), "old\n", "new\n", func(string, int) error { return stop }), stop)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -117,10 +125,22 @@ func TestExpensiveDiffBudget(t *testing.T) {
 		fmt.Fprintf(&src, "line %d\n", i)
 		fmt.Fprintf(&dst, "line %d\n", 29999-i)
 	}
+	t.Run("budget", func(t *testing.T) {
+		// An exhausted search scans the whole file instead of an approximate patch.
+		defer func(timeout time.Duration) { diffTimeout = timeout }(diffTimeout)
+		diffTimeout = 50 * time.Millisecond
+		var additions []string
+		require.NoError(t, lineAdditions(t.Context(), src.String(), dst.String(), func(raw string, line int) error {
+			require.Equal(t, 1, line)
+			additions = append(additions, raw)
+			return nil
+		}))
+		require.Equal(t, []string{dst.String()}, additions)
+	})
 	for _, cancelDuringSearch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel=%v", cancelDuringSearch), func(t *testing.T) {
-			// Exercise an earlier caller deadline without waiting for the full
-			// one-minute search budget in the test suite.
+			// An earlier caller deadline shortens the search; cancellation is
+			// reported rather than scanning the whole file.
 			ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
 			defer cancel()
 			if cancelDuringSearch {
@@ -128,16 +148,19 @@ func TestExpensiveDiffBudget(t *testing.T) {
 				defer timer.Stop()
 			}
 			started := time.Now()
-			err := lineAdditions(ctx, src.String(), dst.String(), func(string, int) error {
-				t.Error("timed-out diff yielded approximate additions")
+			var whole bool
+			err := lineAdditions(ctx, src.String(), dst.String(), func(raw string, _ int) error {
+				whole = raw == dst.String()
 				return nil
 			})
-			if cancelDuringSearch {
+			switch {
+			case cancelDuringSearch:
 				require.ErrorIs(t, err, context.Canceled)
-			} else if !errors.Is(err, context.DeadlineExceeded) {
-				// The search can hit its shortened budget before the context's
-				// deadline timer runs.
-				require.ErrorContains(t, err, "computation budget")
+			case err == nil:
+				// The shortened search can end just before the deadline fires.
+				require.True(t, whole, "an exhausted search scans the whole file")
+			default:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
 			}
 			require.Less(t, time.Since(started), 5*time.Second)
 		})

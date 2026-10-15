@@ -16,7 +16,11 @@ if betterleaksEnabled():
     try:
         # The hook owns the Git producer; the Betterleaks CLI/library only reads stdin.
         with subprocess.Popen(
-            ["git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color"],
+            [
+                "git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color",
+                # Fixed prefixes keep file paths intact under diff.noprefix and similar settings.
+                "--src-prefix=a/", "--dst-prefix=b/",
+            ],
             stdout=subprocess.PIPE,
         ) as producer:
             try:

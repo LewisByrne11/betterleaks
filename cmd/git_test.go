@@ -3,12 +3,12 @@ package cmd
 import (
 	"archive/zip"
 	"bytes"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -159,42 +159,40 @@ func TestGitIncludeMerges(t *testing.T) {
 	gitCmdT(t, repo, "branch", "-D", "side")
 	configPath := writeTestConfig(t, "[[rules]]\nid='merge-secret'\nregex='SECRET_[A-Z_]+'\n")
 
-	for _, workers := range []int{1, 4} {
-		for _, tc := range []struct {
-			name      string
-			flag      string
-			wantMerge bool
-		}{
-			{"default", "", true},
-			{"included", "--include=merges", true},
-			{"excluded", "--exclude=merges", false},
-		} {
-			t.Run(fmt.Sprintf("workers=%d/%s", workers, tc.name), func(t *testing.T) {
-				root, stdout := newTestCLI(t)
-				args := []string{"git", repo, fmt.Sprintf("--git-workers=%d", workers), "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
-				if tc.flag != "" {
-					args = append(args, tc.flag)
+	for _, tc := range []struct {
+		name      string
+		flag      string
+		wantMerge bool
+	}{
+		{"default", "", true},
+		{"included", "--include=merges", true},
+		{"excluded", "--exclude=merges", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, stdout := newTestCLI(t)
+			args := []string{"git", repo, "--include=commit-messages", "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}
+			if tc.flag != "" {
+				args = append(args, tc.flag)
+			}
+			root.SetArgs(args)
+			require.NoError(t, root.Execute())
+			_, findings := decodeScanJSON(t, stdout.Bytes())
+			var values []string
+			for _, f := range findings {
+				values = append(values, f.Match.Value)
+				switch f.Match.Value {
+				case "SECRET_SIDE":
+					require.Equal(t, sideSHA, f.Attributes["git.sha"])
+				case "SECRET_MERGE_MESSAGE", "SECRET_MERGE_CONTENT":
+					require.Equal(t, mergeSHA, f.Attributes["git.sha"])
 				}
-				root.SetArgs(args)
-				require.NoError(t, root.Execute())
-				_, findings := decodeScanJSON(t, stdout.Bytes())
-				var values []string
-				for _, f := range findings {
-					values = append(values, f.Match.Value)
-					switch f.Match.Value {
-					case "SECRET_SIDE":
-						require.Equal(t, sideSHA, f.Attributes["git.sha"])
-					case "SECRET_MERGE_MESSAGE", "SECRET_MERGE_CONTENT":
-						require.Equal(t, mergeSHA, f.Attributes["git.sha"])
-					}
-				}
-				want := []string{"SECRET_ROOT", "SECRET_SIDE", "SECRET_MERGE_MESSAGE"}
-				if tc.wantMerge {
-					want = append(want, "SECRET_MERGE_CONTENT")
-				}
-				require.ElementsMatch(t, want, values)
-			})
-		}
+			}
+			want := []string{"SECRET_ROOT", "SECRET_SIDE", "SECRET_MERGE_MESSAGE"}
+			if tc.wantMerge {
+				want = append(want, "SECRET_MERGE_CONTENT")
+			}
+			require.ElementsMatch(t, want, values)
+		})
 	}
 }
 
@@ -244,18 +242,21 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 func TestGoGitOptionValidation(t *testing.T) {
 	for _, cmd := range []GitCmd{
 		{Exclude: []string{"unknown"}}, {Exclude: []string{"history"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
-		{GitCacheMiB: -1}, {GitCacheMiB: 4097},
-		{MaxCommits: -1},
-		{GitWorkers: -1}, {GitWorkers: 17}, {GitDiskCacheMiB: -2}, {GitDiskCacheMiB: 4097},
+		{MaxCommits: -1}, {GitMaxBlobMiB: -1}, {GitMaxBlobMiB: 4097}, {Revision: "main...side"},
+		{Include: []string{"reflog-history"}, Exclude: []string{"history"}},
 	} {
 		require.Error(t, cmd.Validate())
 	}
-	require.NoError(t, (GitCmd{Author: "Test", Since: "2001-01-01", GitWorkers: 4}).Validate())
-	require.NoError(t, (GitCmd{GitWorkers: 16}).Validate())
-	source, err := (GitCmd{GitCacheMiB: 32}).gitSource()
+	require.NoError(t, (GitCmd{Author: "Test", Since: "2001-01-01", GitMaxBlobMiB: 4096, Revision: "main..HEAD"}).Validate())
+	source, err := (GitCmd{AllowExternal: true}).gitSource()
 	require.NoError(t, err)
-	require.Equal(t, 32, source.CacheMiB)
+	require.True(t, source.AllowExternalObjects)
 	require.Empty(t, source.Exclude, "default resources are not excluded")
+	// A date-only --until includes that whole day; --since starts at midnight.
+	source, err = (GitCmd{Since: "2001-01-02", Until: "2001-01-02"}).gitSource()
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2001, 1, 2, 0, 0, 0, 0, time.UTC), *source.Since)
+	require.Equal(t, time.Date(2001, 1, 2, 23, 59, 59, 999999999, time.UTC), *source.Until)
 	source, err = (GitCmd{Include: []string{"objects"}, Exclude: []string{"history"}}).gitSource()
 	require.NoError(t, err)
 	require.Equal(t, []string{"history"}, source.Exclude)
@@ -266,10 +267,6 @@ func TestGoGitOptionValidation(t *testing.T) {
 	require.Equal(t, []string{"commit-messages", "notes"}, source.Include)
 	require.Equal(t, []string{"history"}, source.Exclude)
 	require.NoError(t, source.Validate())
-
-	source, err = (GitCmd{GitDiskCacheMiB: -1}).gitSource()
-	require.NoError(t, err)
-	require.Equal(t, -1, source.DiskCacheMiB)
 }
 
 func TestStdinGitDiff(t *testing.T) {

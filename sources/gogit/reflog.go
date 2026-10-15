@@ -18,9 +18,10 @@ import (
 )
 
 // Reflogs are local journals, not Git objects. Stream them without keeping a
-// reverse index or sorting by timestamps. History deduplicates their tips with
-// ordinary ref history. Old IDs matter: a reset can discard its old tip.
-func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *history, messages bool, yield sources.FragmentsFunc) error {
+// reverse index or sorting by timestamps. When roots is set, every recorded old
+// and new commit becomes a history root; the walk's visited set deduplicates
+// them with ref history. Old IDs matter: a reset can discard its old tip.
+func (s *Source) reflogs(ctx context.Context, store *objectStorage, roots *history, messages bool, yield sources.FragmentsFunc) error {
 	cfg, err := store.Config()
 	if err != nil {
 		return err
@@ -40,7 +41,7 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *histor
 		defer f.Close()
 		scanner := bufio.NewScanner(f)
 		// Bound a single untrusted entry; total log length is streamed.
-		scanner.Buffer(make([]byte, 4096), 1<<20)
+		scanner.Buffer(make([]byte, 4096), maxReflogRecord)
 		// Require complete records. Scanner's default SplitLines accepts a
 		// truncated final record, which could silently lose part of a message.
 		scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
@@ -63,9 +64,11 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *histor
 					sources.AttrGitReflogRef:        ref,
 					sources.AttrGitReflogActorName:  e.name,
 					sources.AttrGitReflogActorEmail: e.email,
-					"git.reflog_date":               e.when.UTC().Format(time.RFC3339),
-					"git.reflog_old_sha":            e.old.String(), "git.reflog_new_sha": e.new.String(),
-					"git.reflog_log": name, "git.reflog_line": strconv.Itoa(line),
+					sources.AttrGitReflogDate:       e.when.UTC().Format(time.RFC3339),
+					sources.AttrGitReflogOldSHA:     e.old.String(),
+					sources.AttrGitReflogNewSHA:     e.new.String(),
+					sources.AttrGitReflogLog:        name,
+					sources.AttrGitReflogLine:       strconv.Itoa(line),
 				}
 				if s.Prefilter == nil || !s.Prefilter(attrs) {
 					if err := yield(sources.Fragment{Raw: e.message, StartLine: 1, Attributes: attrs}, nil); err != nil {
@@ -73,12 +76,12 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, tips *histor
 					}
 				}
 			}
-			if tips != nil {
+			if roots != nil {
 				for _, id := range []plumbing.Hash{e.old, e.new} {
 					if id.IsZero() {
 						continue
 					}
-					if err := tips.tip(ctx, id); err != nil {
+					if err := roots.tip(ctx, id); err != nil {
 						return fmt.Errorf("reflog %s line %d: %w", name, line, err)
 					}
 				}
@@ -150,8 +153,8 @@ func walkReflogs(ctx context.Context, root *os.Root, name, ref string, depth int
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if depth > 64 {
-		return errors.New("reflog directory nesting exceeds 64 levels")
+	if depth > maxReflogDepth {
+		return fmt.Errorf("reflog directory nesting exceeds %d levels", maxReflogDepth)
 	}
 	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) && depth == 0 {

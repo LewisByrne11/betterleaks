@@ -53,18 +53,18 @@ func TestPackedObjectBounds(t *testing.T) {
 			data := append(make([]byte, 12), tc.data...)
 			p := &objectPack{file: packBytes{bytes.NewReader(data)}, end: int64(len(data)), hashSize: 20}
 			s := &objectStorage{ctx: t.Context(), limit: 1024}
-			kind, _, _, raw, err := s.inflate(p, 12)
+			e, err := s.inflate(p, 12)
 			if !tc.valid {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, plumbing.BlobObject, kind)
-			require.Equal(t, "abc", raw)
+			require.Equal(t, plumbing.BlobObject, e.kind)
+			require.Equal(t, "abc", e.raw)
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			s.ctx = ctx
-			_, _, _, _, err = s.inflate(p, 12)
+			_, err = s.inflate(p, 12)
 			require.ErrorIs(t, err, context.Canceled)
 		})
 	}
@@ -80,9 +80,9 @@ func FuzzPackedObject(f *testing.F) {
 		data := append(make([]byte, 12), input...)
 		p := &objectPack{file: packBytes{bytes.NewReader(data)}, end: int64(len(data)), hashSize: 20}
 		s := &objectStorage{ctx: t.Context(), limit: 65536}
-		_, _, _, raw, err := s.inflate(p, 12)
+		e, err := s.inflate(p, 12)
 		if err == nil {
-			require.LessOrEqual(t, len(raw), 65536)
+			require.LessOrEqual(t, len(e.raw), 65536)
 		}
 	})
 }
@@ -129,18 +129,18 @@ func TestPackedObjects(t *testing.T) {
 						break
 					}
 					require.NoError(t, err)
-					kind, _, _, _, err := store.inflate(p, int64(e.Offset))
+					entry, err := store.inflate(p, int64(e.Offset))
 					require.NoError(t, err)
-					if kind.IsDelta() {
+					if entry.kind.IsDelta() {
 						deltas++
 						want := plumbing.REFDeltaObject
 						if offsets {
 							want = plumbing.OFSDeltaObject
 						}
-						require.Equal(t, want, kind)
+						require.Equal(t, want, entry.kind)
 					}
 					store.objects.Clear() // Exercise reconstruction, not an earlier cache hit.
-					o, err := store.read(e.Hash, 0)
+					o, err := store.read(e.Hash)
 					require.NoError(t, err)
 					h := plumbing.NewHasher(objectFormat, o.Type(), o.Size())
 					h.Write([]byte(o.raw))

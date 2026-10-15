@@ -43,11 +43,14 @@ func objectIDs(ctx context.Context, store *objectStorage, yield func(plumbing.Ha
 func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool, yield sources.FragmentsFunc) error {
 	store := r.Storer.(*objectStorage)
 	emit := func(id plumbing.Hash) error {
-		attrs := map[string]string{sources.AttrResource: sources.ResourceGitBlob, AttrBlobSHA: id.String()}
+		attrs := map[string]string{sources.AttrResource: sources.ResourceGitBlob, sources.AttrGitBlobSHA: id.String()}
 		if s.Prefilter != nil && s.Prefilter(attrs) {
 			return nil
 		}
 		obj, err := store.EncodedObject(plumbing.AnyObject, id)
+		if isLimit(err) {
+			return skip(yield, err, "object %s", id)
+		}
 		if err != nil {
 			return fmt.Errorf("object %s: %w", id, err)
 		}
@@ -70,11 +73,10 @@ func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool,
 	// This optional pass retains compact IDs and one traversal byte per object,
 	// not decoded objects or a commit-to-path reverse index. Fail explicitly at
 	// the bound instead of producing a partial classification without warning.
-	const maxObjectIDs = 8_000_000
 	var ids []plumbing.Hash
 	if err := objectIDs(ctx, store, func(id plumbing.Hash) error {
-		if len(ids) == maxObjectIDs {
-			return errors.New("unreachable-object inventory exceeds eight million objects; use objects to scan all blobs without reachability classification")
+		if len(ids) == maxUnreachableObjects {
+			return fmt.Errorf("unreachable-object inventory exceeds %d objects; use objects to scan all blobs without reachability classification", maxUnreachableObjects)
 		}
 		ids = append(ids, id)
 		return nil
@@ -103,6 +105,7 @@ func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool,
 // Blob edges are marked without decompressing their contents. Gitlinks refer to
 // a different repository and must not be followed.
 func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Hash) ([]byte, error) {
+	store := r.Storer.(*objectStorage)
 	reached := make([]byte, len(ids))
 	type edge struct {
 		id   plumbing.Hash
@@ -173,7 +176,7 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 		}
 		switch obj := obj.(type) {
 		case *object.Commit:
-			for _, parent := range obj.ParentHashes {
+			for _, parent := range store.parents(obj) {
 				if err := add(parent, plumbing.CommitObject); err != nil {
 					return nil, err
 				}

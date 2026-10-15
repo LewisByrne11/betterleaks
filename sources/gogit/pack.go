@@ -17,6 +17,10 @@ import (
 	"github.com/go-git/go-git/v6/x/fdpool"
 )
 
+// Packs beyond this many use go-git's reader. Each mapped pack holds two file
+// handles, and repositories with this many packs are due for a repack anyway.
+const maxMappedPacks = 32
+
 type objectPack struct {
 	index    *idxfile.LazyIndex
 	file     idxfile.ReadAtCloser
@@ -25,12 +29,12 @@ type objectPack struct {
 }
 
 func (s *objectStorage) openPacks(fs readOnlyFS) error {
-	ids, err := s.Storage.ObjectPacks()
+	ids, err := s.ObjectPacks()
 	if err != nil {
 		return err
 	}
 	pool := fdpool.New(64)
-	for _, id := range ids[:min(len(ids), 32)] {
+	for _, id := range ids[:min(len(ids), maxMappedPacks)] {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
@@ -63,21 +67,21 @@ func (s *objectStorage) openPacks(fs readOnlyFS) error {
 		}
 		version := binary.BigEndian.Uint32(header[4:8])
 		if string(header[:4]) != "PACK" || (version != 2 && version != 3) {
-			return errors.New("invalid Git pack header")
+			return errors.New("invalid git pack header")
 		}
 		count, err := index.Count()
 		if err != nil {
 			return err
 		}
 		if int64(binary.BigEndian.Uint32(header[8:])) != count {
-			return errors.New("Git pack/index object count mismatch")
+			return errors.New("git pack/index object count mismatch")
 		}
 		var footer [32]byte
 		if _, err := f.ReadAt(footer[:id.Size()], p.end); err != nil {
 			return err
 		}
 		if id.Compare(footer[:id.Size()]) != 0 {
-			return errors.New("Git pack/index checksum mismatch")
+			return errors.New("git pack/index checksum mismatch")
 		}
 	}
 	return nil
@@ -100,118 +104,137 @@ type packInflater struct {
 
 var packInflaters = sync.Pool{New: func() any { return &packInflater{input: bufio.NewReaderSize(nil, 8192)} }}
 
-func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash, depth int) (*storedObject, error) {
-	if err := s.ctx.Err(); err != nil {
-		return nil, err
+// readPacked reconstructs a packed object. It walks the delta chain down to a
+// cached or undeltified base, then applies the deltas back up. Chain depth
+// costs memory for the delta instructions only, never stack frames.
+func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash) (*storedObject, error) {
+	type link struct {
+		id    plumbing.Hash
+		delta string
 	}
-	if depth > 128 {
-		return nil, errors.New("Git delta chain exceeds 128 levels")
-	}
-	if o, ok := s.objects.Get(id); ok {
-		if o, ok := o.(*storedObject); ok {
-			return o, nil
+	var chain []link
+	var base *storedObject
+	for base == nil {
+		if err := s.ctx.Err(); err != nil {
+			return nil, err
 		}
-	}
-	if o, ok := s.disk.get(id); ok {
-		s.objects.Put(o)
-		return o, nil
-	}
-	kind, baseOffset, baseID, raw, err := s.inflate(p, offset)
-	if err != nil {
-		return nil, fmt.Errorf("pack object %s: %w", id, err)
-	}
-	if kind.IsDelta() {
-		var base *storedObject
-		if kind == plumbing.OFSDeltaObject {
-			baseID, err = p.index.FindHash(baseOffset)
-			if err == nil {
-				base, err = s.readPacked(p, baseOffset, baseID, depth+1)
+		if base = s.cached(id); base != nil {
+			break
+		}
+		if o, ok := s.disk.get(id); ok {
+			s.objects.Put(o)
+			base = o
+			break
+		}
+		e, err := s.inflate(p, offset)
+		if err != nil {
+			return nil, fmt.Errorf("pack object %s: %w", id, err)
+		}
+		if !e.kind.IsDelta() {
+			base = &storedObject{id: id, kind: e.kind, raw: e.raw}
+			s.keep(base)
+			break
+		}
+		if len(chain) == maxDeltaChain {
+			return nil, fmt.Errorf("git delta chain for %s exceeds %d links", chain[0].id, maxDeltaChain)
+		}
+		chain = append(chain, link{id, e.raw})
+		if e.kind == plumbing.OFSDeltaObject {
+			offset = e.baseOffset
+			if id, err = p.index.FindHash(offset); err != nil {
+				return nil, err
 			}
-		} else {
-			base, err = s.read(baseID, depth+1)
+			continue
 		}
+		id = e.baseID
+		next, nextOffset, err := s.locate(id)
 		if err != nil {
 			return nil, err
 		}
-		raw, err = applyDelta(s.ctx, base.raw, raw, s.limit)
-		if err != nil {
-			return nil, fmt.Errorf("delta %s: %w", id, err)
+		if next == nil {
+			if base, err = s.readFallback(id); err != nil {
+				return nil, err
+			}
+			break
 		}
-		kind = base.kind
+		p, offset = next, nextOffset
 	}
-	o := &storedObject{id: id, kind: kind, raw: raw}
-	s.disk.put(o)
-	s.objects.Put(o)
-	return o, nil
+	for i := len(chain) - 1; i >= 0; i-- {
+		raw, err := applyDelta(s.ctx, base.raw, chain[i].delta, s.limit)
+		if err != nil {
+			return nil, fmt.Errorf("delta %s: %w", chain[i].id, err)
+		}
+		base = &storedObject{id: chain[i].id, kind: base.kind, raw: raw}
+		s.keep(base)
+	}
+	return base, nil
 }
 
-func (s *objectStorage) inflate(p *objectPack, offset int64) (kind plumbing.ObjectType, baseOffset int64, baseID plumbing.Hash, raw string, err error) {
+// packEntry is one inflated pack record. Deltas name their base by offset
+// (OFS) or by object ID (REF).
+type packEntry struct {
+	kind       plumbing.ObjectType
+	baseOffset int64
+	baseID     plumbing.Hash
+	raw        string
+}
+
+func (s *objectStorage) inflate(p *objectPack, offset int64) (packEntry, error) {
+	var e packEntry
 	if offset < 12 || offset >= p.end {
-		err = errors.New("Git pack offset out of bounds")
-		return
+		return e, errors.New("git pack offset out of bounds")
 	}
 	inflater := packInflaters.Get().(*packInflater)
 	defer func() { inflater.input.Reset(nil); packInflaters.Put(inflater) }()
 	r := inflater.input
 	r.Reset(io.NewSectionReader(p.file, offset, p.end-offset))
-	b, e := r.ReadByte()
-	if e != nil {
-		err = e
-		return
+	b, err := r.ReadByte()
+	if err != nil {
+		return e, err
 	}
-	kind = plumbing.ObjectType((b >> 4) & 7)
-	if !kind.Valid() {
-		err = errors.New("invalid Git pack object type")
-		return
+	e.kind = plumbing.ObjectType((b >> 4) & 7)
+	if !e.kind.Valid() {
+		return e, errors.New("invalid git pack object type")
 	}
 	size := uint64(b & 15)
 	for shift := uint(4); b&128 != 0; shift += 7 {
 		if shift >= 63 {
-			err = errors.New("Git pack object size overflow")
-			return
+			return e, errors.New("git pack object size overflow")
 		}
-		b, err = r.ReadByte()
-		if err != nil {
-			return
+		if b, err = r.ReadByte(); err != nil {
+			return e, err
 		}
 		if uint64(b&127) > uint64(s.limit)>>shift {
-			err = errors.New("Git pack object size exceeds reconstruction limit")
-			return
+			return e, limitf("packed object exceeds reconstruction limit %d", s.limit)
 		}
 		size |= uint64(b&127) << shift
 	}
 	if size > uint64(s.limit) {
-		err = fmt.Errorf("packed object size %d exceeds reconstruction limit %d", size, s.limit)
-		return
+		return e, limitf("packed object size %d exceeds reconstruction limit %d", size, s.limit)
 	}
-	switch kind {
+	switch e.kind {
 	case plumbing.OFSDeltaObject:
-		b, err = r.ReadByte()
-		if err != nil {
-			return
+		if b, err = r.ReadByte(); err != nil {
+			return e, err
 		}
 		distance := uint64(b & 127)
 		for b&128 != 0 {
 			if distance+1 > uint64(offset)>>7 {
-				err = errors.New("Git delta offset out of bounds")
-				return
+				return e, errors.New("git delta offset out of bounds")
 			}
-			b, err = r.ReadByte()
-			if err != nil {
-				return
+			if b, err = r.ReadByte(); err != nil {
+				return e, err
 			}
 			distance = ((distance + 1) << 7) | uint64(b&127)
 		}
 		if distance == 0 || distance > uint64(offset-12) {
-			err = errors.New("Git delta offset out of bounds")
-			return
+			return e, errors.New("git delta offset out of bounds")
 		}
-		baseOffset = offset - int64(distance)
+		e.baseOffset = offset - int64(distance)
 	case plumbing.REFDeltaObject:
-		baseID.ResetBySize(p.hashSize)
-		_, err = baseID.ReadFrom(r)
-		if err != nil {
-			return
+		e.baseID.ResetBySize(p.hashSize)
+		if _, err = e.baseID.ReadFrom(r); err != nil {
+			return e, err
 		}
 	}
 	if inflater.reader == nil {
@@ -220,24 +243,22 @@ func (s *objectStorage) inflate(p *objectPack, offset int64) (kind plumbing.Obje
 		err = inflater.reader.(zlib.Resetter).Reset(r, nil)
 	}
 	if err != nil {
-		return
+		return e, err
 	}
 	var out strings.Builder
 	out.Grow(int(size))
 	_, err = io.CopyBuffer(&out, io.LimitReader(contextReader{s.ctx, inflater.reader}, int64(size)+1), inflater.buffer[:])
-	closeErr := inflater.reader.Close()
-	if err == nil {
+	if closeErr := inflater.reader.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		return
+		return e, err
 	}
 	if uint64(out.Len()) != size {
-		err = errors.New("Git packed object size mismatch")
-		return
+		return e, errors.New("git packed object size mismatch")
 	}
-	raw = out.String()
-	return
+	e.raw = out.String()
+	return e, nil
 }
 
 // applyDelta validates the complete instruction stream before allocating its
@@ -268,7 +289,7 @@ func applyDelta(ctx context.Context, base, delta string, limit int64) (string, e
 		return "", err
 	}
 	if targetSize > uint64(limit) {
-		return "", fmt.Errorf("delta size %d exceeds reconstruction limit %d", targetSize, limit)
+		return "", limitf("delta size %d exceeds reconstruction limit %d", targetSize, limit)
 	}
 	var out strings.Builder
 	for pass := 0; pass < 2; pass++ {

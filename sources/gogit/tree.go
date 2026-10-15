@@ -2,23 +2,32 @@ package gogit
 
 import (
 	"context"
-	"fmt"
+	"path"
 	"strings"
 
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
-func treeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (object.Changes, error) {
-	changes, err := rawTreeChanges(ctx, c, cache)
+// treeChanges compares a commit's tree with its first parent's, or with the
+// empty tree when parent is zero, and pairs renamed files.
+func treeChanges(ctx context.Context, cache *treeCache, c *object.Commit, parent plumbing.Hash) (object.Changes, error) {
+	changes, err := rawTreeChanges(ctx, cache, c, parent)
 	if err != nil {
 		return nil, err
 	}
-	// TreeEntryFile enforces checkout-safe names, even though rename detection
-	// only reads blobs by ID. Historical paths (including a literal backslash
-	// in GitLab) need not be portable checkout paths. Give those blob handles a
-	// harmless name; ChangeEntry.Name still holds the actual path used to score
-	// renames and emit metadata. No tree content is materialized on disk.
+	return detectRenames(changes)
+}
+
+// detectRenames pairs similar deletions and additions. go-git's detector opens
+// each blob through Tree.TreeEntryFile, which rejects names that are unsafe to
+// check out (for example a literal backslash, as in GitLab's history). This
+// source never checks anything out and only reads blobs by ID, so the entries
+// get a placeholder name for the detector; ChangeEntry.Name keeps the real path
+// used for scoring and metadata, and the entry names are restored afterwards.
+// go-git offers no option to skip that validation.
+func detectRenames(changes object.Changes) (object.Changes, error) {
 	for _, change := range changes {
 		if change.From.Name != "" {
 			change.From.TreeEntry.Name = "blob"
@@ -27,30 +36,29 @@ func treeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (objec
 			change.To.TreeEntry.Name = "blob"
 		}
 	}
-	changes, err = object.DetectRenames(changes, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000})
+	changes, err := object.DetectRenames(changes, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000})
 	for _, change := range changes {
 		if change.From.Name != "" {
-			change.From.TreeEntry.Name = change.From.Name[strings.LastIndexByte(change.From.Name, '/')+1:]
+			change.From.TreeEntry.Name = path.Base(change.From.Name)
 		}
 		if change.To.Name != "" {
-			change.To.TreeEntry.Name = change.To.Name[strings.LastIndexByte(change.To.Name, '/')+1:]
+			change.To.TreeEntry.Name = path.Base(change.To.Name)
 		}
 	}
 	return changes, err
 }
 
-func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (object.Changes, error) {
+func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, parent plumbing.Hash) (object.Changes, error) {
 	var old *object.Tree
-	if len(c.ParentHashes) > 0 {
-		parent, err := c.Parent(0)
+	if !parent.IsZero() {
+		p, err := cache.r.CommitObject(parent)
 		if err != nil {
 			return nil, err
 		}
-		if parent.TreeHash == c.TreeHash {
+		if p.TreeHash == c.TreeHash {
 			return nil, nil
 		}
-		old, err = cache.get(parent.TreeHash)
-		if err != nil {
+		if old, err = cache.get(p.TreeHash); err != nil {
 			return nil, err
 		}
 	}
@@ -62,19 +70,17 @@ func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (ob
 	// A small tree DAG can expand into exponentially many paths. Bound each
 	// comparison (workers release it before taking another commit), including
 	// empty directories and path bytes, not just the number of unique objects.
-	const maxEntries, maxChanges, maxPathBytes = 1_000_000, 100_000, 16 << 20
 	entries, pathBytes := 0, 0
 	charge := func(nameBytes int) error {
 		entries++
 		pathBytes += nameBytes
-		if entries > maxEntries || len(changes) >= maxChanges || pathBytes > maxPathBytes {
-			return fmt.Errorf("git tree comparison exceeds expansion budget (%d entries, %d changes, %d path bytes)", maxEntries, maxChanges, maxPathBytes)
+		if entries > maxTreeEntries || len(changes) >= maxTreeChanges || pathBytes > maxTreePathBytes {
+			return limitf("tree comparison exceeds %d entries, %d changes, or %d path bytes", maxTreeEntries, maxTreeChanges, maxTreePathBytes)
 		}
 		return ctx.Err()
 	}
 	var walk func(*object.Tree, *object.Tree, string) error
-	var expand func(*object.Tree, object.TreeEntry, string, bool) error
-	expand = func(tree *object.Tree, entry object.TreeEntry, prefix string, added bool) error {
+	expand := func(tree *object.Tree, entry object.TreeEntry, prefix string, added bool) error {
 		if err := charge(len(prefix) + len(entry.Name)); err != nil {
 			return err
 		}
@@ -100,8 +106,8 @@ func rawTreeChanges(ctx context.Context, c *object.Commit, cache *treeCache) (ob
 		return nil
 	}
 	walk = func(from, to *object.Tree, prefix string) error {
-		if strings.Count(prefix, "/") > 256 {
-			return fmt.Errorf("Git tree nesting exceeds 256 levels")
+		if strings.Count(prefix, "/") > maxTreeDepth {
+			return limitf("tree nesting exceeds %d levels", maxTreeDepth)
 		}
 		if err := ctx.Err(); err != nil {
 			return err

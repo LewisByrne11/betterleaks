@@ -23,12 +23,10 @@ type GitCmd struct {
 	Until           string   `group:"source" help:"Maximum committer date, RFC3339 or YYYY-MM-DD (UTC)."`
 	Author          string   `group:"source" help:"Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"Go regular expression matching committer name and email."`
-	Revision        string   `group:"source" help:"Starting revision; when omitted, scans all refs."`
-	MaxCommits      int      `group:"source" name:"max-commits" help:"Maximum selected commits; zero is unlimited."`
-	GitWorkers      int      `group:"source" name:"git-workers" help:"Concurrent history readers (default up to 8; maximum 16)."`
-	GitCacheMiB     int      `group:"source" name:"git-cache-mib" help:"Cached object content in MiB; zero uses 256 MiB. This is not a process memory limit."`
-	GitDiskCacheMiB int      `group:"source" name:"git-disk-cache-mib" help:"Temporary object cache in MiB; zero uses 1024 MiB, -1 disables. Removed after scanning."`
-	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Maximum diff input size; exceeding it reports an incomplete scan."`
+	Revision        string   `group:"source" help:"Revision or range (A..B) to scan; when omitted, scans HEAD and all refs."`
+	MaxCommits      int      `group:"source" name:"max-commits" help:"Scan only the newest N selected commits; zero is unlimited."`
+	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Skip and report blobs larger than this many MiB."`
+	AllowExternal   bool     `group:"source" name:"allow-external-objects" help:"Read Git storage outside the repository (a .git file, commondir, or object alternate pointing elsewhere)."`
 	Exclude         []string `group:"source" help:"Remove Git resources: history, merges, objects, unreachable-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history."`
 	Include         []string `group:"source" help:"Add Git resources: history, merges, objects, unreachable-objects, commit-messages, notes, tag-messages, reflog-messages, reflog-history (default: history with merges)."`
 	Repo            string   `arg:"" optional:"" help:"Local repository or HTTP(S) repository URL to scan."`
@@ -37,9 +35,6 @@ type GitCmd struct {
 func (cmd GitCmd) Validate() error {
 	if err := cmd.ScanFlags.Validate(); err != nil {
 		return err
-	}
-	if cmd.GitWorkers < 0 || cmd.GitWorkers > 16 {
-		return errors.New("--git-workers must be between 0 and 16")
 	}
 	src, err := cmd.gitSource()
 	if err != nil {
@@ -94,45 +89,47 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 	findings := mustNewFindingCollector(runtime, &options.ScanFlags, globals.NoColor, start, cfg, "git", source)
 	findings.startScan(runtime)
 	summary, err := runner.Scan(runtime.Context, src, findings.Add)
-	if err != nil {
+	if errors.Is(err, gogit.ErrExternalStore) {
+		runtime.Logger().Error("failed to scan Git repository; pass --allow-external-objects to read storage outside it", "error", err)
+	} else if err != nil {
 		runtime.Logger().Error("failed to scan Git repository", "error", err)
 	}
 
 	findingSummaryAndExit(runtime, summary, runner.ValidationEnabled(), findings, options.ExitCode, start, err)
 }
 
+// gitSource converts flags; gogit.Source.Validate checks the values.
+//
+//nolint:exhaustruct // Unset source options keep their documented defaults.
 func (cmd GitCmd) gitSource() (*gogit.Source, error) {
-	parseDate := func(value string) (*time.Time, error) {
+	// A date-only --until includes that whole day.
+	parseDate := func(value string, endOfDay bool) (*time.Time, error) {
 		if value == "" {
 			return nil, nil
 		}
-		for _, layout := range []string{time.RFC3339, "2006-01-02"} {
-			if date, err := time.Parse(layout, value); err == nil {
-				return &date, nil
-			}
+		if date, err := time.Parse(time.RFC3339, value); err == nil {
+			return &date, nil
 		}
-		return nil, fmt.Errorf("invalid history date %q; use RFC3339 or YYYY-MM-DD", value)
+		date, err := time.Parse(time.DateOnly, value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid history date %q; use RFC3339 or YYYY-MM-DD", value)
+		}
+		if endOfDay {
+			date = date.Add(24*time.Hour - time.Nanosecond)
+		}
+		return &date, nil
 	}
-	since, err := parseDate(cmd.Since)
+	since, err := parseDate(cmd.Since, false)
 	if err != nil {
 		return nil, err
 	}
-	until, err := parseDate(cmd.Until)
+	until, err := parseDate(cmd.Until, true)
 	if err != nil {
 		return nil, err
 	}
 	platform, err := scm.PlatformFromString(cmd.Platform)
 	if err != nil {
 		return nil, err
-	}
-	if cmd.GitMaxBlobMiB < 0 || cmd.GitMaxBlobMiB > 4096 {
-		return nil, errors.New("--git-max-blob-mib must be between 0 and 4096")
-	}
-	if cmd.GitCacheMiB < 0 || cmd.GitCacheMiB > 4096 {
-		return nil, errors.New("--git-cache-mib must be between 0 and 4096")
-	}
-	if cmd.GitDiskCacheMiB < -1 || cmd.GitDiskCacheMiB > 4096 {
-		return nil, errors.New("--git-disk-cache-mib must be between -1 and 4096")
 	}
 	repo := cmd.Repo
 	if repo == "" {
@@ -145,9 +142,12 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 			token = remoteGitToken(url)
 		}
 	}
-	return &gogit.Source{RepoPath: repo, URL: url, Token: token, Revision: cmd.Revision, All: cmd.Revision == "", Since: since, Until: until,
-		Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCommits, Workers: cmd.GitWorkers, CacheMiB: cmd.GitCacheMiB, DiskCacheMiB: cmd.GitDiskCacheMiB,
-		Prefilter: nil, Logger: nil, RemoteURL: "", MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth}, nil
+	return &gogit.Source{
+		RepoPath: repo, URL: url, Token: token,
+		Revision: cmd.Revision, Since: since, Until: until, Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCommits,
+		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude,
+		AllowExternalObjects: cmd.AllowExternal, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth,
+	}, nil
 }
 
 // An existing path wins even when its spelling resembles a URL.

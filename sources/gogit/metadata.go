@@ -20,14 +20,15 @@ import (
 // Notes are ordinary commits and trees under refs/notes/*. Scan each changed
 // note version, including notes later removed. Their commit metadata describes
 // the note edit; git.note_target identifies the annotated object, not its author.
+//
+//nolint:exhaustruct // Cache bookkeeping starts empty.
 func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.FragmentsFunc) error {
 	refs, err := r.Storer.IterReferences()
 	if err != nil {
 		return err
 	}
 	defer refs.Close()
-	trees := new(treeCache)
-	trees.r = r
+	trees := &treeCache{r: r}
 	store := r.Storer.(*objectStorage)
 	accept := s.selector()
 	for {
@@ -44,15 +45,16 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 		if !strings.HasPrefix(ref.Name().String(), "refs/notes/") {
 			continue
 		}
-		selection := *s
-		selection.All, selection.Revision = false, ref.Name().String()
-		history, err := selection.history(ctx, r, scanPatches)
-		if err != nil {
-			return err
+		name := ref.Name()
+		if ref, err = storer.ResolveReference(r.Storer, name); err != nil {
+			return fmt.Errorf("notes ref %s: %w", name, err)
 		}
-		selected := 0
-		for s.MaxCount == 0 || selected < s.MaxCount {
-			commit, _, err := history.next(ctx)
+		walk := newWalk(r)
+		if err := walk.tip(ctx, ref.Hash()); err != nil {
+			return fmt.Errorf("notes ref %s: %w", name, err)
+		}
+		for selected := 0; s.MaxCount == 0 || selected < s.MaxCount; {
+			commit, err := walk.next(ctx)
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -63,38 +65,58 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 				continue
 			}
 			selected++
-			changes, err := treeChanges(ctx, commit, trees)
-			if err != nil {
+			if err := s.noteVersion(ctx, store, trees, name.String(), commit, yield); err != nil {
 				return err
-			}
-			for _, change := range changes {
-				if change.To.Name == "" || change.To.TreeEntry.Mode == filemode.Submodule {
-					continue
-				}
-				id := change.To.TreeEntry.Hash
-				attrs := commitAttributes(commit)
-				attrs[sources.AttrResource] = sources.ResourceGitNote
-				attrs["git.notes_ref"], attrs[AttrBlobSHA] = ref.Name().String(), id.String()
-				target := strings.ReplaceAll(change.To.Name, "/", "")
-				if len(target) == id.Size()*2 && plumbing.IsHash(target) {
-					attrs["git.note_target"] = target
-				}
-				if s.Prefilter != nil && s.Prefilter(attrs) {
-					continue
-				}
-				obj, err := store.read(id, 0)
-				if err != nil {
-					return err
-				}
-				if obj.kind != plumbing.BlobObject {
-					return plumbing.ErrObjectNotFound
-				}
-				if err := yield(sources.Fragment{Raw: obj.raw, StartLine: 1, Attributes: attrs}, nil); err != nil {
-					return err
-				}
 			}
 		}
 	}
+}
+
+func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *treeCache, ref string, commit *object.Commit, yield sources.FragmentsFunc) error {
+	var parent plumbing.Hash
+	if parents := store.parents(commit); len(parents) > 0 {
+		parent = parents[0]
+	}
+	changes, err := treeChanges(ctx, trees, commit, parent)
+	if isLimit(err) {
+		return skip(yield, err, "notes commit %s", commit.Hash)
+	}
+	if err != nil {
+		return err
+	}
+	for _, change := range changes {
+		if change.To.Name == "" || change.To.TreeEntry.Mode == filemode.Submodule {
+			continue
+		}
+		id := change.To.TreeEntry.Hash
+		attrs := commitAttributes(commit)
+		attrs[sources.AttrResource] = sources.ResourceGitNote
+		attrs[sources.AttrGitNotesRef], attrs[sources.AttrGitBlobSHA] = ref, id.String()
+		target := strings.ReplaceAll(change.To.Name, "/", "")
+		if len(target) == id.Size()*2 && plumbing.IsHash(target) {
+			attrs[sources.AttrGitNoteTarget] = target
+		}
+		if s.Prefilter != nil && s.Prefilter(attrs) {
+			continue
+		}
+		obj, err := store.read(id)
+		if isLimit(err) {
+			if err := skip(yield, err, "note %s", id); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if obj.kind != plumbing.BlobObject {
+			return plumbing.ErrObjectNotFound
+		}
+		if err := yield(sources.Fragment{Raw: obj.raw, StartLine: 1, Attributes: attrs}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Lightweight tags have no message. Nested annotations are scanned too, but
@@ -125,8 +147,8 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if depth == 32 {
-				return errors.New("annotated tag nesting exceeds 32 levels")
+			if depth == maxTagNesting {
+				return fmt.Errorf("annotated tag nesting exceeds %d levels", maxTagNesting)
 			}
 			obj, err := r.Storer.EncodedObject(plumbing.AnyObject, id)
 			if err != nil {
@@ -140,13 +162,14 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 				return err
 			}
 			attrs := map[string]string{
-				sources.AttrResource:       sources.ResourceGitTagMessage,
-				sources.AttrGitTagName:     tag.Name,
-				sources.AttrGitTaggerName:  tag.Tagger.Name,
-				sources.AttrGitTaggerEmail: tag.Tagger.Email,
-				"git.tagger_date":          tag.Tagger.When.UTC().Format(time.RFC3339),
-				"git.tag_sha":              tag.Hash.String(), "git.tag_target": tag.Target.String(),
-				"git.tag_source_ref": ref.Name().String(),
+				sources.AttrResource:        sources.ResourceGitTagMessage,
+				sources.AttrGitTagName:      tag.Name,
+				sources.AttrGitTaggerName:   tag.Tagger.Name,
+				sources.AttrGitTaggerEmail:  tag.Tagger.Email,
+				sources.AttrGitTaggerDate:   tag.Tagger.When.UTC().Format(time.RFC3339),
+				sources.AttrGitTagSHA:       tag.Hash.String(),
+				sources.AttrGitTagTarget:    tag.Target.String(),
+				sources.AttrGitTagSourceRef: ref.Name().String(),
 			}
 			if depth == 0 {
 				attrs[sources.AttrGitTagRef] = ref.Name().String()

@@ -185,6 +185,9 @@ func TestPreCommitHookCommands(t *testing.T) {
 	}
 	git("init", "--quiet")
 	git("config", "color.ui", "always")
+	// The producer's fixed prefixes must keep paths intact under user settings.
+	git("config", "diff.noprefix", "true")
+	require.NoError(t, os.Mkdir("dir", 0o700))
 	configPath := filepath.Join(t.TempDir(), "rules.toml")
 	require.NoError(t, os.WriteFile(configPath, []byte("[[rules]]\nid='hook-secret'\nregex='SECRET_PRIVATE'\n"), 0o600))
 
@@ -195,10 +198,13 @@ func TestPreCommitHookCommands(t *testing.T) {
 			if strings.HasPrefix(entry, "ghcr.io/") {
 				t.Skip("pinned released Docker image uses the legacy CLI; not the working tree binary")
 			}
-			require.Contains(t, entry, "bash -o pipefail")
-			require.Contains(t, entry, "git diff --cached --no-ext-diff --no-textconv --no-color")
-			_, scannerArgs, ok := strings.Cut(entry, "| betterleaks ")
+			require.Contains(t, entry, "bash -o pipefail -c '")
+			producer, scannerArgs, ok := strings.Cut(entry, "| betterleaks ")
 			require.True(t, ok)
+			_, producer, ok = strings.Cut(producer, "-c '")
+			require.True(t, ok)
+			producerArgs := strings.Fields(producer)
+			require.Equal(t, []string{"git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"}, producerArgs)
 			// A CRLF checkout leaves a carriage return after the shell quote.
 			scannerArgs = strings.TrimSuffix(scannerArgs, "\r")
 			for name, ending := range map[string]string{"LF": "", "CRLF": "\r"} {
@@ -213,12 +219,12 @@ func TestPreCommitHookCommands(t *testing.T) {
 							if secret {
 								content = "SECRET_PRIVATE\n"
 							}
-							require.NoError(t, os.WriteFile("input.txt", []byte(content), 0o600))
-							git("add", "input.txt")
+							require.NoError(t, os.WriteFile("dir/input.txt", []byte(content), 0o600))
+							git("add", "dir/input.txt")
 							root, output := newTestCLI(t)
 							code := 0
 							root.runtime.exit = func(n int) { code = n; panic(n) }
-							patch, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color").Output()
+							patch, err := exec.Command(producerArgs[0], producerArgs[1:]...).Output()
 							require.NoError(t, err)
 							root.SetIn(bytes.NewReader(patch))
 							root.SetArgs(append(append([]string{}, args...), "--no-banner", "--config", configPath))
@@ -235,6 +241,7 @@ func TestPreCommitHookCommands(t *testing.T) {
 							if secret {
 								require.Equal(t, 1, code)
 								require.Contains(t, output.String(), "REDACTED")
+								require.Contains(t, output.String(), "dir/input.txt")
 							} else {
 								require.Zero(t, code)
 								require.Empty(t, output.String())

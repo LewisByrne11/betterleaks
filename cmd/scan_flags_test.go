@@ -515,11 +515,12 @@ func TestRemovedWorkerFlagsAreRejected(t *testing.T) {
 	}
 }
 
-func TestGitWorkerFlagSelectsSourceConcurrency(t *testing.T) {
-	cli, err := parseCLIForTest(t, "git", "--git-workers=16")
-	require.NoError(t, err)
-	require.Equal(t, 16, cli.Git.GitWorkers)
-	require.Zero(t, cli.Git.Jobs, "source workers must not override detection concurrency")
+// The Git source picks its own read concurrency and cache sizes.
+func TestGitTuningFlagsRemoved(t *testing.T) {
+	for _, flag := range []string{"--git-workers=16", "--git-cache-mib=32", "--git-disk-cache-mib=64"} {
+		_, err := parseCLIForTest(t, "git", flag)
+		require.Error(t, err, flag)
+	}
 }
 
 func TestGitMergeOptionValidation(t *testing.T) {

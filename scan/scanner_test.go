@@ -2690,7 +2690,7 @@ func TestFromGit(t *testing.T) {
 			cfg := loadTestConfig(t, "simple")
 			scanner := mustNew(t, cfg)
 
-			var src sources.Source = &gogit.Source{RepoPath: tt.source, All: true, MaxArchiveDepth: 8, Prefilter: mustPrefilter(t, cfg.PrefilterExpr)}
+			var src sources.Source = &gogit.Source{RepoPath: tt.source, MaxArchiveDepth: 8, Prefilter: mustPrefilter(t, cfg.PrefilterExpr)}
 			if tt.logOpts != "" {
 				args := append([]string{"-C", tt.source, "log", "-p", "-U0"}, strings.Fields(tt.logOpts)...)
 				patch, err := exec.Command("git", args...).Output()

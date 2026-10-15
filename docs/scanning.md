@@ -51,13 +51,12 @@ betterleaks filesystem . -j 8
 betterleaks github https://github.com/my-company -j 8
 ```
 
-Sources choose their own bounded I/O concurrency. Git history readers also
-accept `--git-workers` (maximum 16), independently of detection concurrency:
+Sources choose their own bounded I/O concurrency, independently of detection:
 
 | Source work | Concurrency |
 | :--- | :--- |
 | Filesystem readers | `GOMAXPROCS` |
-| Git history workers | Up to `min(GOMAXPROCS, 8)`; adjustable with `--git-workers` |
+| Git history workers | Up to `min(GOMAXPROCS, 8)` |
 | S3 and Hugging Face object reads | 4 |
 | GitHub Actions runs | 4 |
 | Provider repositories or buckets | One target at a time |
@@ -561,242 +560,209 @@ validation and analysis are disabled, as they are by default.
 
 ## `git`
 
-The Git source reads objects directly using go-git and the bounded pack reader.
-It never executes Git, hooks, diff helpers, filters, SSH, or credential helpers.
-The CLI scans history reachable from all refs by default, comparing each commit
-with its first parent and scanning added lines. Both parents' histories are
-visited. `--exclude=merges` suppresses merge patches; it does not remove
-parent history or selected commit messages. Diff boundaries and rename choices
-can differ from Git's implementation.
+The Git source reads repository objects in-process with go-git. It never runs
+`git`, hooks, diff or textconv helpers, filters, SSH, or credential helpers, so
+scanning an untrusted repository cannot execute anything it configures.
+
+By default it scans the history reachable from HEAD and every ref. Each commit is
+compared with its first parent and only added lines are scanned; both parents of
+a merge are walked.
 
 ```sh
-betterleaks git .
+betterleaks git .                                # all history
+betterleaks git . --revision=origin/main..HEAD   # commits not yet on origin/main
 betterleaks git . --include=commit-messages,notes
 betterleaks git . --since=2026-01-01 --author='Example <'
-betterleaks git . --revision=origin/main
-betterleaks git https://github.com/owner/repo --include=commit-messages
+betterleaks git https://github.com/owner/repo
 ```
 
-Resources can be combined independently. `--include` **adds** to the defaults;
-`--exclude` removes resources. Both accept comma-separated or repeated values.
-Unknown names, a name present in both flags, and selections with nothing left
-to scan are errors.
+### What to scan
 
-| Resource | Content | Default |
+`--include` adds resources to the default and `--exclude` removes them. Both take
+comma-separated or repeated values. Unknown names, a name in both lists, and a
+selection that leaves nothing to scan are errors.
+
+| Resource | Scans | Default |
 |---|---|---|
-| `history` | Added file content across selected commits, from packed or loose objects | On |
-| `merges` | Merge patches against the first parent, within either history resource | On with history |
-| `objects` | Complete contents of every stored blob, once per object ID | Off |
-| `unreachable-objects` | Complete blobs outside HEAD and all current refs, whether loose or packed | Off |
-| `commit-messages` | Full messages of selected commits | Off |
-| `notes` | Historical note contents, including versions subsequently removed | Off |
-| `tag-messages` | Annotated-tag messages, including nested annotations | Off |
-| `reflog-messages` | Local ref-update journal messages | Off |
-| `reflog-history` | Added file content in commits retained by local reflogs, including abandoned history | Off |
+| `history` | Added lines in each commit's patch | On |
+| `merges` | Merge commits' patches against their first parent | On with `history` |
+| `commit-messages` | Each commit's full message | Off |
+| `reflog-history` | Also walks commits that local reflogs remember, such as ones removed by reset, amend, or rebase | Off |
+| `notes` | Every version of every note under `refs/notes/*`, including removed notes | Off |
+| `tag-messages` | Annotated tag messages | Off |
+| `reflog-messages` | The text of local reflog entries | Off |
+| `objects` | Every stored blob, whole, once per object | Off |
+| `unreachable-objects` | Stored blobs not reachable from HEAD or any ref | Off |
 
-| Desired scan | Flags |
+`merges` and `reflog-history` change the commit walk rather than scanning
+anything themselves. `merges` needs `history`. `reflog-history` adds commits to
+`history`, `commit-messages`, or both, so one of them must be on.
+
+`objects` and `unreachable-objects` scan whole blobs, archives included, with
+`resource=git.blob` and `git.blob_sha` but no path or commit: a blob has neither.
+Reflogs and the index don't make a blob reachable, so abandoned and staged
+content counts as unreachable. `objects` includes the unreachable blobs.
+
+| Goal | Flags |
 |---|---|
-| History only | No flags |
 | History without merge patches | `--exclude=merges` |
-| Add messages to the default scan | `--include=commit-messages` |
-| All supported resources | `--include=objects,commit-messages,notes,tag-messages,reflog-messages,reflog-history` |
-| Messages only | `--include=commit-messages --exclude=history` |
-| Notes only | `--include=notes --exclude=history` |
-| Messages and notes only | `--include=commit-messages,notes --exclude=history` |
-| All blobs only | `--include=objects --exclude=history` |
-| Unreachable blobs only | `--include=unreachable-objects --exclude=history` |
-| Add unreachable blobs | `--include=unreachable-objects` |
-| Tag messages only | `--include=tag-messages --exclude=history` |
-| Reflog messages only | `--include=reflog-messages --exclude=history` |
-| Include abandoned local history | `--include=reflog-history` |
+| Only commit messages | `--include=commit-messages --exclude=history` |
+| Abandoned local history | `--include=reflog-history` |
+| Everything | `--include=commit-messages,notes,tag-messages,reflog-messages,reflog-history,objects` |
 
-`merges` controls patches within `history` and `reflog-history`. If neither is
-selected, merge patches are disabled; explicitly including `merges` then is an
-error. Excluding `merges` preserves both parents' histories and any enabled
-commit-message scanning, including merge commit messages.
+### Which commits
 
-History (including merge patches) is the sole default. `--exclude=history`
-alone is an error because it leaves nothing selected. `loose-objects` has been
-removed: storage layout does not determine whether content belongs to history.
+- `--revision=REV` starts at one revision. `--revision=A..B` scans the commits
+  reachable from B but not from A, and `A..` means `A..HEAD`. `A...B` is not
+  supported.
+- `--since` and `--until` filter by committer time, in RFC3339 or `YYYY-MM-DD`
+  (UTC). A date-only `--until` includes that whole day. Filtering never prunes the
+  walk, so backdated commits are still found.
+- `--author` and `--committer` are Go regular expressions matched against
+  `Name <email>`.
+- `--max-commits=N` scans the newest N selected commits by committer time, across
+  every starting point.
+- `--include=reflog-history` adds the reflogs' commits to whatever `--revision`
+  selects. Commits a range excludes stay excluded.
+- A path inside a work tree scans the whole repository containing it, as Git does.
+- In a shallow clone, the oldest fetched commits are scanned as if they were root
+  commits, as `git log -p` shows them: their whole tree appears as added. For
+  exact attribution, fetch full history (`fetch-depth: 0` in GitHub Actions).
 
-Messages-only scans do not compare file trees or read file blobs. Notes-only
-and all-object scans do not traverse ordinary commit history. Excluding a
-resource disables that pass; it does not suppress the same content found through
-another enabled resource. In particular, `--include=objects --exclude=unreachable-objects`
-still scans every blob, including unreachable ones.
+Notes and tag and reflog messages aren't restricted by `--revision`. Date,
+identity, and count filters apply to note commits but not to tag or reflog
+messages.
 
-`--since` and `--until` inclusively filter committer timestamps using RFC3339 or
-YYYY-MM-DD (UTC). `--author` and `--committer` are Go regular expressions over
-`Name <email>`. By default, history reachable from all refs is scanned.
-`--revision` selects a starting revision instead (for example, `--revision=HEAD`
-or `--revision=main`). `--max-commits` limits selected commits. Timestamp
-filters do not prune ancestry, so backdated commits remain discoverable.
+### Finding metadata
 
-`objects` and `unreachable-objects` scan complete blobs, including binaries and
-archives, through the existing file scanner. They enumerate loose and packed
-objects, including supported alternate stores, and use `resource=git.blob` and
-`git.blob_sha`. No filename, author, or commit is invented. Commit and tag messages
-remain separate resources; raw tree/commit encodings are not scanned as text.
-Selecting both object resources scans each blob once because `objects` contains
-the entire unreachable subset. History patches and full blobs remain distinct
-resources and can produce overlapping findings. Path and commit filters cannot
-supply missing metadata for object findings.
+- Patches: `path`, line numbers, `git.sha`, author, committer, and `git.blob_sha`.
+- Commit messages: `resource=git.commit_message` with commit metadata. Line
+  numbers are relative to the message.
+- Notes: `resource=git.note`, `git.notes_ref`, and `git.note_target` (the
+  annotated object). `git.sha` and author describe the note edit, not the
+  annotated commit.
+- Tag messages: `resource=git.tag_message`, `git.tag_sha`, `git.tag_target`,
+  tagger, and `git.tag_source_ref`. Only the outermost annotation of a nested tag
+  has `git.tag_ref` and a tag link.
+- Reflog messages: `resource=git.reflog_message`, `git.reflog_ref`, actor,
+  `git.reflog_date`, old and new IDs, and the log file and line. A reflog actor
+  is who moved the ref, not who wrote the commit.
 
-Unreachable means outside **HEAD and all current refs**, including notes and tags
-pointing directly to blobs or trees. Reflogs and the index are deliberately not
-roots, so abandoned history and staged, never-committed content remain eligible.
-This differs from default `git fsck`, which also considers reflogs and the index.
-Date, author, revision, merge, and count filters do not change this classification.
-Excluding history therefore cannot expand the object pass. Classification walks
-commit/tree/tag references without reading reachable blob contents (except blobs
-referenced directly by a ref). Missing reachable objects report incomplete
-coverage rather than being treated as unreachable. The optional classification
-inventory is bounded to eight million object IDs; exceeding it reports an error.
-`objects` avoids that full inventory and enumerates IDs by hash prefix.
+Links are built from the local repository's fetch remote. Use
+`--platform=github` or `--platform=gitlab` for self-hosted services, or
+`--platform=none` to disable them. Links aren't checked over the network, so an
+unpublished commit can produce a link that 404s. Findings without a link show
+`local only` in terminal output.
 
-`--include=commit-messages` scans each selected commit's full message, including
-empty commits. Findings have `resource=git.commit_message`, commit metadata,
-and message-relative line numbers. Reports abbreviate `git.message` to its first
-line, with `...` when the body contains additional text. The finding snippet
-shows the matched lines; use the commit link or SHA to inspect the full message.
-`--include=notes` scans changed note versions
-through the history of every local `refs/notes/*` ref, including notes later
-removed. Notes use `resource=git.note`, `git.notes_ref`, `git.note_target` (the
-annotated object), and `git.blob_sha`. Their `git.sha` and author describe the
-**note edit**, not the annotated commit. Date/identity/count filters apply to
-note commits; `--revision` selects ordinary history and commit messages, not notes. Note
-versions are scanned in full and may repeat unchanged text across edits.
-With `--include=objects`, note blobs can also be found as unattributed full blobs. Notes refs are excluded from ordinary file history.
+### Limits and incomplete scans
 
+Some content is too large to scan exactly. Betterleaks either scans more than
+necessary or reports what it skipped; it never drops content silently.
 
-`--include=tag-messages` reads all local `refs/tags/*` annotations. Lightweight
-tags have no message. Findings use `resource=git.tag_message` and identify the tag object (`git.tag_sha`), its target
-(`git.tag_target`), tagger identity/time, and the ref through which it was found
-(`git.tag_source_ref`). Only the outer annotation has `git.tag_ref` and a tag-page
-link; a nested annotation need not have a ref of its own. Tag IDs are not reported
-as commit IDs. Aliased tags are scanned per ref so ref-dependent filters work.
+- A blob larger than `--git-max-blob-mib` (default 64) is skipped and reported.
+- A commit whose tree comparison exceeds 1,000,000 entries, 100,000 changed
+  paths, or 16 MiB of path names is skipped and reported.
+- A diff over one million lines, or one that takes more than a minute to compute,
+  is not approximated: the whole new file is scanned instead. That can repeat
+  findings but never misses any.
 
-Reflogs are **local journals of ref updates**, such as commits, resets, rebases,
-and branch switches. They can retain commits no longer reachable from branches
-or tags. `--include=reflog-messages` scans the journal text itself, with
-`resource=git.reflog_message`, `git.reflog_ref`, actor name/email, update time
-(`git.reflog_date`), old/new object IDs, and log path/record number. Snippet line
-numbers are relative to the message. A reflog actor/time is not commit authorship
-or the time a secret was introduced or pushed.
+Skipped content marks the scan incomplete while the rest of the repository is
+still scanned. Damaged archives produce warnings, as in filesystem scans, and
+don't mark the scan incomplete. Missing or corrupt objects and invalid refs stop
+the scan. `unreachable-objects` holds up to eight million object IDs to
+classify reachability; for larger repositories, use `objects`.
 
-`--include=reflog-history` adds both old and new reflog IDs as history roots,
-including linked worktrees' journals. Ordinary history is scanned first, then
-additional reflog commits, using one visited set and one `--max-commits` budget.
-Shared messages and patches are emitted once each; a count limit gives ordinary
-history priority. A commit selected for its message can also receive a reflog
-patch without consuming another count slot. Excluding ordinary history can free
-count slots for additional reflog commits, so limited scans can select different
-content. Date/identity/count filters apply to the actual commits; `--revision` does not restrict these
-additional roots. Excluding `history` suppresses ordinary file patches, while
-`commit-messages` continues to scan the selected ordinary refs. Adding
-`reflog-history` adds reflog-rooted patches and, when messages are enabled,
-messages from additional reflog commits. It never removes ordinary messages.
-Reflogs for notes refs can also retain note-edit commits; their tree additions
-appear as ordinary patches in this broad history traversal.
+### Storage outside the repository
 
-Tag and reflog messages are independent of commit date/identity/count filters
-and `--revision`; source attribute filters can select them. Neither message-only
-pass compares file trees. Annotated tag messages are scanned per referring tag
-ref, including nested annotations. Shared tag objects can therefore produce
-multiple findings with distinct `git.tag_source_ref` attributes; this preserves
-ref-specific filtering and attribution.
-Reflog records are streamed with a 1 MiB per-record
-limit and a 64-level directory-depth limit; unsupported links, malformed or
-truncated records, and missing history objects report incomplete coverage.
-Missing journals are normal. Reflogs expire, may be disabled, and are not fetched
-from remotes. Reflog resources cannot recover garbage-collected content or unreachable
-objects absent from both refs and reflogs; the object resources can scan the
-latter if they are still stored. Scan a stable
-repository when possible: concurrent ref updates or garbage collection can
-invalidate a scan.
+A `.git` file, `commondir`, or `objects/info/alternates` can point at Git storage
+anywhere on disk. By default Betterleaks refuses storage outside the repository's
+directory, so a crafted repository cannot make it read, and report the secrets
+of, another repository on the same machine. Linked worktrees created with
+`git worktree add` are allowed because their main repository registers them.
 
-HTTP(S) repositories are fetched directly in Go into a temporary mirror, without
-a checkout or submodules, and removed after scanning. `--token` supplies HTTPS
-basic authentication. Known public hosts can use `GITHUB_TOKEN`, `GITLAB_TOKEN`,
-or `HUGGINGFACE_TOKEN`/`HF_TOKEN`. Tokens are not inferred for arbitrary hosts.
-URLs containing credentials, queries, or fragments are rejected. SSH cloning is
-unsupported. GitHub, GitLab, and Hugging Face repository scans use this same
-reader and clone implementation.
+Repositories cloned with `--shared` or `--reference`, and submodule checkouts
+scanned directly, need `--allow-external-objects`. Relative alternates are not
+supported.
 
-SDK callers use `gogit.Source` from `sources/gogit`:
+### Remote repositories
+
+HTTP(S) repositories are fetched in Go into a temporary mirror, with no checkout
+or submodules, and removed after scanning. `--token` supplies HTTPS basic
+authentication; for github.com, gitlab.com, and huggingface.co the token can also
+come from `GITHUB_TOKEN`, `GITLAB_TOKEN`, or `HUGGINGFACE_TOKEN`/`HF_TOKEN`.
+Tokens are never inferred for other hosts. URLs with credentials, queries, or
+fragments are rejected, and SSH is not supported. The GitHub, GitLab, and Hugging
+Face sources clone and scan repositories the same way.
+
+### SDK
 
 ```go
-history := &gogit.Source{RepoPath: ".", All: true}
-remote := &gogit.Source{URL: "https://github.com/owner/repo", All: true}
+history := &gogit.Source{RepoPath: "."}
+pullRequest := &gogit.Source{RepoPath: ".", Revision: "origin/main..HEAD"}
+remote := &gogit.Source{URL: "https://github.com/owner/repo"}
 ```
 
-The SDK's zero-value history selection starts at HEAD. Its `Include` and
-`Exclude` slices use the same additive/subtractive resource selection as the CLI.
-For example, `Include: []string{"objects"}, Exclude: []string{"history"}` scans all blobs without history patches.
-Keep configuration immutable while scanning.
-Worker queues and caches are bounded. `--git-workers` defaults to at most eight
-(maximum 16); `--jobs` independently controls detection. Memory/disk cache flags
-remain available, and `--git-max-blob-mib` bounds diff inputs. These settings are
-not a total process memory limit. SHA-1 and SHA-256 repositories are supported.
-Shallow repositories and relative alternates currently produce explicit
-unsupported errors. A file's edit search has a one-minute computation budget;
-exceeding it reports an incomplete scan rather than using an approximate patch.
-An earlier context deadline shortens that budget. Cancellation during the edit
-search is checked when the bounded call returns, which can take up to one minute
-without an earlier deadline.
-Each tree comparison permits at most 1,000,000 visited entries, 100,000 changes,
-and 16 MiB of expanded path bytes. Exceeding these limits reports incomplete
-coverage, including for small tree DAGs that expand into very many paths.
-
-Unreadable or corrupt archive contents produce warnings and scanning continues,
-as with filesystem scans. Archive warnings alone do not mark a Git scan incomplete;
-repository-read failures and diff-limit errors still do.
-
-Supported fetch remotes generate SCM URLs from local configuration. Use
-`--platform=github` or `--platform=gitlab` for self-hosted services, or
-`--platform=none` to disable links. Findings without a URL display `local only`
-in terminal output; JSON retains an absent URL, not a fake link. URLs are not
-network-verified: a locally unpublished commit may still produce a URL that
-returns 404. Notes and unattributed blobs have no SCM link.
+The zero value scans HEAD and every ref, and `Include`/`Exclude` work as on the
+CLI. Skipped content arrives as an error in the yield callback, and the scan
+continues. Storage outside the repository fails with `gogit.ErrExternalStore`
+unless `AllowExternalObjects` is set. `Workers` and `CacheMiB` tune reading.
+`DiskCacheMiB` enables a temporary-file cache of large reconstructed objects for
+repositories with deep delta chains of large files; the file holds repository
+content, so it is off by default. Don't change a Source while it is scanning.
 
 ### Caller-supplied patches
 
-`--git-engine`, `--log-opts`, `--staged`, `--unstaged`, and `--pre-receive` have
-been removed. Use `stdin --git-diff` for arbitrary Git history selection or local
-patches. Betterleaks parses the stream and runs no producer process itself:
+For anything the Git source doesn't select, such as staged changes or a
+pre-receive hook, produce a patch with Git and pipe it to `stdin --git-diff`.
+Betterleaks parses the stream and runs nothing itself:
 
 ```sh
-# Any Git log selection supported by your installed Git
 set -o pipefail
-git log -p --no-ext-diff --no-textconv --no-color --all --since='90 days ago' |
-  betterleaks stdin --git-diff
 
 # Staged additions, including an initial commit
-git diff --cached --no-ext-diff --no-textconv --no-color |
+git diff --cached --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ |
   betterleaks stdin --git-diff --redact
 
 # Unstaged additions to tracked files
-git diff --no-ext-diff --no-textconv --no-color | betterleaks stdin --git-diff
+git diff --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ |
+  betterleaks stdin --git-diff
+
+# Any history selection your Git supports
+git log -p --all --since='90 days ago' --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ |
+  betterleaks stdin --git-diff
 ```
 
-Use `--no-color` even when piping: Git configuration can force colored output.
-The explicit helper-disabling options prevent the producer from invoking
-repository-selected diff helpers. Use pipeline failure propagation in automation
-so a failed Git producer cannot look like an empty successful scan. The scanner
-cannot know an upstream process's exit status.
+Each flag matters:
 
-The parser keeps added text, file paths, supported commit headers, and original
-line coordinates, including patches with context. Removed/context lines and
-commit messages are not scanned as content. Binary patches do not contain the
-original bytes and are skipped; scan the repository or files to inspect them.
-Combined merge patches are rejected; request `--diff-merges=first-parent` or
-`--diff-merges=separate` from the producer. Empty input is valid. SDK callers can
-use `sources.GitDiff{Content: reader}` with the same prefilter and yield contract.
+- `--no-ext-diff` and `--no-textconv` keep Git from running diff helpers that
+  repository configuration selects.
+- `--no-color` is needed even when piping, because configuration can force color.
+- The fixed prefixes keep file paths intact under settings like `diff.noprefix`.
+- `pipefail` makes a failed Git command fail the pipeline instead of looking like
+  an empty, clean scan.
 
-For pre-receive hooks, the caller must select the pushed revision ranges and
-pipe ordinary patches to
-`stdin --git-diff`. Git's quarantine object environment is not handled by the
-object source.
+Removed and context lines and commit messages aren't scanned. Binary patches
+don't contain file bytes and are skipped. Combined merge patches are rejected;
+use `--diff-merges=first-parent` or `--diff-merges=separate`. SDK callers can use
+`sources.GitDiff{Content: reader}`.
+
+A pre-receive hook scans the commits being pushed. Git quarantines them until
+the hook accepts the push, and `git log` inside the hook can read them:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+while read -r old new ref; do
+  [[ $new =~ ^0+$ ]] && continue                   # deleted ref
+  if [[ $old =~ ^0+$ ]]; then
+    range=("$new" --not --all)                      # new ref: commits on no existing ref
+  else
+    range=("$old..$new")
+  fi
+  git log -p --diff-merges=first-parent --format=medium --no-abbrev-commit \
+    --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ "${range[@]}"
+done | betterleaks stdin --git-diff --redact
+```
 
 ---
 
