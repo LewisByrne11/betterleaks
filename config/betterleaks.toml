@@ -8741,9 +8741,97 @@ description = "Identified an Okta Access Token, which may compromise identity ma
 regex = '''(?i:(?:(?-i:[Oo]kta|OKTA))(?:[ \t\w.-]{0,20})[\s'"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(00[\w=\-]{40})(?:\\?['"\x60]|[\s;]|\\[nr]|$)'''
 confidence = "high"
 keywords = ["okta"]
+validate = '''
+let domain = components["okta-domain"]?.secret ?? "";
+domain == "" ? {
+  "result": "needs_validation",
+  "reason": "Okta access token verification requires an Okta tenant domain"
+} : (
+  let r = http.get("https://" + domain + "/api/v1/users/me", {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": "SSWS " + finding["secret"]
+  });
+  r.status == 200 && (r.body contains "\"activated\":") ? {
+    "result": "valid"
+  } : r.status == 401 ? {
+    "result": "invalid",
+    "reason": "Unauthorized"
+  } : validate.unknown(r)
+)
+'''
 filter = '''
 entropy(finding["secret"]) <= 4.0
 '''
+components = [
+    { id = "okta-domain", optional = true, within = "20L" },
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# okta-client-id
+# ──────────────────────────────────────────────────────────────────────────────
+[[rules]]
+id = "okta-client-id"
+description = "Identified an Okta OAuth 2.0 Client ID, used as a component of the Okta OAuth client-secret rule."
+regex = '''(?:[^a-zA-Z0-9_-]|^)(0oa[a-zA-Z0-9]{17})(?:[^a-zA-Z0-9_-]|$)'''
+confidence = "medium"
+keywords = ["0oa"]
+skipReport = true
+filter = '''
+entropy(finding["secret"]) < 3.0
+'''
+
+# ──────────────────────────────────────────────────────────────────────────────
+# okta-domain
+# ──────────────────────────────────────────────────────────────────────────────
+[[rules]]
+id = "okta-domain"
+description = "Okta tenant domain, used as an optional component for validating Okta credentials."
+regex = '''(?i)(?:^|[^a-z0-9.-])([a-z0-9-]{1,40}\.(?:okta(?:preview|-emea|-gov)?\.com|okta\.mil))(?:[^a-z0-9.-]|$)'''
+confidence = "high"
+keywords = [".okta"]
+skipReport = true
+filter = '''
+matchesAny(finding["secret"], [`(?i)^(?:developer|www|help|support|status|login|forum|sec|example|invalid|subdomain|your-?domain)\.`])
+'''
+
+# ──────────────────────────────────────────────────────────────────────────────
+# okta-oauth-client-secret
+# ──────────────────────────────────────────────────────────────────────────────
+[[rules]]
+id = "okta-oauth-client-secret"
+description = "Identified an Okta OAuth 2.0 Client Secret, which could allow unauthorized access to Okta applications and APIs."
+regex = '''(?i)(?:client[_-]?secret|(?-i:[Oo]kta|OKTA)[_.-]?(?:[a-z0-9_.-]+[_.-])?secret)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-zA-Z0-9_-]{40,64})(?:[^a-zA-Z0-9_-]|$)'''
+confidence = "high"
+keywords = ["secret"]
+validate = '''
+let domain = components["okta-domain"]?.secret ?? "";
+domain == "" ? {
+  "result": "needs_validation",
+  "reason": "Okta OAuth client secret verification requires an Okta tenant domain"
+} : (
+  let r = http.post("https://" + domain + "/oauth2/default/v1/token", {
+    "Accept": "application/json",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Authorization": "Basic " + base64.encode(bytes((components["okta-client-id"]?.secret ?? "") + ":" + finding["secret"]))
+  }, "grant_type=client_credentials");
+  r.status == 200 && (r.json?.access_token ?? "") != "" ? {
+    "result": "valid"
+  } : r.status == 400 && (r.json?.error ?? "") == "unauthorized_client" ? {
+    "result": "valid"
+  } : r.status == 401 || (r.status == 400 && (r.json?.error ?? "") == "invalid_client") ? {
+    "result": "invalid",
+    "reason": "Invalid client credentials"
+  } : validate.unknown(r)
+)
+'''
+filter = '''
+entropy(finding["secret"]) < 3.5 || tokenRatio(finding["secret"]) >= 2.5
+'''
+components = [
+    { id = "okta-client-id", within = "20L" },
+    { id = "okta-domain", optional = true, within = "20L" },
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ollama-api-key
